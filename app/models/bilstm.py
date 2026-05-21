@@ -32,6 +32,10 @@ def build_bilstm() -> tf.keras.Model:
 def train_bilstm(X: np.ndarray, y: np.ndarray, uid: str) -> tf.keras.Model:
     X_ssa = np.array([apply_ssa_to_dataframe(x) for x in X])
     model = build_bilstm()
+    if len(X_ssa) < 10:
+        raise ValueError(
+            f"Need at least 10 training samples for validation_split=0.1, got {len(X_ssa)}"
+        )
     early_stop = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
     model.fit(
         X_ssa, y,

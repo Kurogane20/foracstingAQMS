@@ -5,6 +5,7 @@ from app.models.ssa import ssa_decompose, apply_ssa_to_dataframe
 
 
 def test_ssa_decompose_returns_two_arrays():
+    np.random.seed(42)
     series = np.sin(np.linspace(0, 4 * np.pi, N_INPUT_HOURS)) + np.random.randn(N_INPUT_HOURS) * 0.1
     trend, oscillation = ssa_decompose(series, SSA_WINDOW)
     assert trend.shape == (N_INPUT_HOURS,)
