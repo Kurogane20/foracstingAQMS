@@ -26,7 +26,7 @@ def test_run_prediction_returns_6_steps():
         result = run_prediction("test_uid")
     assert len(result) == N_FORECAST_HOURS
     assert result[0]["step"] == 1
-    assert result[5]["step"] == 6
+    assert result[N_FORECAST_HOURS - 1]["step"] == N_FORECAST_HOURS
     assert "pm_25" in result[0]
     assert "aqi_index" in result[0]
 

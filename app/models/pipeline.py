@@ -41,6 +41,8 @@ def run_training(uid: str) -> dict:
     train_bilstm(X_train, y_train, uid)
 
     bilstm_preds_all = np.array([predict_bilstm(X[i : i + 1], uid)[0] for i in range(len(X))])
+    # Synthetic base_times for training — LGBm learns time-of-day patterns
+    # from hour/dayofweek/month features; exact calendar anchor does not affect fit quality.
     base_times = [
         pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i * N_INPUT_HOURS)
         for i in range(len(X))

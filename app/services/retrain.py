@@ -19,7 +19,7 @@ def retrain_sensor(uid: str) -> dict:
             mae_score=result["mae_score"],
             error_message=None,
         )
-        return {"uid": uid, "status": "success", **result}
+        return {"uid": uid, "status": "ready", **result}
     except Exception as e:
         logger.error(f"[{uid}] Training failed: {e}")
         upsert_metadata(uid, status="error", error_message=str(e))

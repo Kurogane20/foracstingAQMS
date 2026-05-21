@@ -17,8 +17,8 @@ def predict_sensor(uid: str) -> dict:
         msg = "Model not trained yet — run /retrain first"
         logger.warning(f"[{uid}] {msg}")
         upsert_metadata(uid, status="untrained", error_message=msg)
-        return {"uid": uid, "status": "error", "message": msg}
+        return {"uid": uid, "status": "error", "error": True, "message": msg}
     except Exception as e:
         logger.error(f"[{uid}] Prediction failed: {e}")
         upsert_metadata(uid, status="error", error_message=str(e))
-        return {"uid": uid, "status": "error", "message": str(e)}
+        return {"uid": uid, "status": "error", "error": True, "message": str(e)}
