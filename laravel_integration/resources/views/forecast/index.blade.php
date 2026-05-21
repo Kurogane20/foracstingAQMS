@@ -21,10 +21,10 @@
                         @else bg-secondary @endif">
                         {{ strtoupper($sensor['status']) }}
                     </span>
-                    @if($sensor['mae_score'])
+                    @if($sensor['mae_score'] ?? null)
                         <p class="mt-2 mb-1 small text-muted">MAE: {{ number_format($sensor['mae_score'], 4) }}</p>
                     @endif
-                    @if($sensor['last_predicted_at'])
+                    @if($sensor['last_predicted_at'] ?? null)
                         <p class="mb-1 small text-muted">
                             Last predicted: {{ $sensor['last_predicted_at'] }}
                         </p>

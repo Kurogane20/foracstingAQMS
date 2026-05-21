@@ -129,6 +129,8 @@ function updateChart() {
     chart.render();
 }
 
-document.addEventListener('DOMContentLoaded', updateChart);
+document.addEventListener('DOMContentLoaded', function() {
+    if (predictions.length > 0) { updateChart(); }
+});
 </script>
 @endpush

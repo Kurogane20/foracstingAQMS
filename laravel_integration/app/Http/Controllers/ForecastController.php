@@ -23,8 +23,12 @@ class ForecastController extends Controller
 
     public function predict(string $uid)
     {
-        $this->forecast->triggerPredict($uid);
+        $ok = $this->forecast->triggerPredict($uid);
+        if ($ok) {
+            return redirect()->route('forecast.show', $uid)
+                             ->with('success', 'Prediksi berhasil diperbarui');
+        }
         return redirect()->route('forecast.show', $uid)
-                         ->with('success', 'Prediksi berhasil diperbarui');
+                         ->with('error', 'Gagal memperbarui prediksi. Coba lagi.');
     }
 }
