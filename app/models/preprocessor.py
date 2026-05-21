@@ -11,8 +11,9 @@ from app.config import (
 
 
 def fetch_sensor_data(uid: str, hours: int = N_INPUT_HOURS) -> pd.DataFrame:
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = None
     try:
+        conn = mysql.connector.connect(**DB_CONFIG)
         cutoff_unix = int(pd.Timestamp.now().timestamp()) - hours * 3600
         query = """
             SELECT datetime_unix, pm_25, pm_25_correction, pm_10, pm_10_correction,
@@ -24,7 +25,8 @@ def fetch_sensor_data(uid: str, hours: int = N_INPUT_HOURS) -> pd.DataFrame:
         """
         df = pd.read_sql(query, conn, params=(uid, cutoff_unix))
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     return df
 
 
@@ -39,6 +41,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df = df.interpolate(method="linear")
     df = df.ffill().bfill()
+    if df.isnull().any().any():
+        raise ValueError("DataFrame still contains NaN after fill — check for all-null sensor columns")
     for col in df.columns:
         q1 = df[col].quantile(0.25)
         q3 = df[col].quantile(0.75)
@@ -77,6 +81,10 @@ def create_sequences(data: np.ndarray, n_in: int, n_out: int) -> tuple:
 def preprocess_for_predict(uid: str) -> tuple:
     df_raw = fetch_sensor_data(uid, hours=N_INPUT_HOURS + 2)
     df_hourly = resample_hourly(df_raw)
+    if len(df_hourly) < N_INPUT_HOURS:
+        raise ValueError(
+            f"Insufficient hourly data for uid={uid}: got {len(df_hourly)} rows, need {N_INPUT_HOURS}"
+        )
     df_clean = clean(df_hourly)
     df_norm, _ = normalize(df_clean, uid, fit=False)
     X = df_norm.values[-N_INPUT_HOURS:][np.newaxis, :, :]  # (1, 24, 14)
