@@ -1,0 +1,5 @@
+.env
+saved_models/**/*.h5
+saved_models/**/*.pkl
+__pycache__/
+venv/
