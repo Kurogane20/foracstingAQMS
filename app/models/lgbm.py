@@ -21,6 +21,7 @@ def train_lgbm(
     y_true: np.ndarray,
     base_times: list,
     uid: str,
+    lgbm_params: dict = None,
 ) -> None:
     X_all, y_all = [], []
     for i, bt in enumerate(base_times):
@@ -29,16 +30,36 @@ def train_lgbm(
         y_all.append(y_true[i])
     X_all = np.vstack(X_all)
     y_all = np.vstack(y_all)
-    base_model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05, num_leaves=31, verbose=-1)
-    model = MultiOutputRegressor(base_model)
-    model.fit(X_all, y_all)
-    model_path = os.path.join(MODELS_DIR, uid, "lgbm.pkl")
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    joblib.dump(model, model_path)
+
+    base = dict(
+        n_estimators=400, learning_rate=0.03, num_leaves=63,
+        min_child_samples=10, subsample=0.8, colsample_bytree=0.8, verbose=-1,
+    )
+    if lgbm_params:
+        base.update(lgbm_params)
+
+    uid_dir = os.path.join(MODELS_DIR, uid)
+    os.makedirs(uid_dir, exist_ok=True)
+
+    for suffix, extra in [
+        ("",       {}),
+        ("_lower", {"objective": "quantile", "alpha": 0.1}),
+        ("_upper", {"objective": "quantile", "alpha": 0.9}),
+    ]:
+        params = {**base, **extra}
+        model = MultiOutputRegressor(lgb.LGBMRegressor(**params))
+        model.fit(X_all, y_all)
+        joblib.dump(model, os.path.join(uid_dir, f"lgbm{suffix}.pkl"))
 
 
-def predict_lgbm(bilstm_output: np.ndarray, base_time: pd.Timestamp, uid: str) -> np.ndarray:
-    model_path = os.path.join(MODELS_DIR, uid, "lgbm.pkl")
-    model = joblib.load(model_path)
+def predict_lgbm(
+    bilstm_output: np.ndarray,
+    base_time: pd.Timestamp,
+    uid: str,
+) -> dict:
     X = build_lgbm_features(bilstm_output, base_time)
-    return model.predict(X)
+    result = {}
+    for key, suffix in [("point", ""), ("lower", "_lower"), ("upper", "_upper")]:
+        path = os.path.join(MODELS_DIR, uid, f"lgbm{suffix}.pkl")
+        result[key] = joblib.load(path).predict(X) if os.path.exists(path) else None
+    return result
