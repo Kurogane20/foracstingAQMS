@@ -36,6 +36,13 @@ def test_parse_bounds_passes_through_already_dict():
     assert result["upper_bounds"] == {"pm_25": 5.0}
 
 
+def test_parse_bounds_handles_corrupt_json():
+    from app.db import _parse_bounds
+    row = {"lower_bounds": "{corrupt", "upper_bounds": None}
+    result = _parse_bounds(row)
+    assert result["lower_bounds"] is None
+
+
 # ---------------------------------------------------------------------------
 # save_predictions — bounds serialization
 # ---------------------------------------------------------------------------

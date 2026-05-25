@@ -5,10 +5,14 @@ from app.config import SENSOR_DB_CONFIG, RESULT_DB_CONFIG
 
 
 def _parse_bounds(row: dict) -> dict:
+    row = dict(row)
     for key in ("lower_bounds", "upper_bounds"):
         val = row.get(key)
         if isinstance(val, str):
-            row[key] = json.loads(val)
+            try:
+                row[key] = json.loads(val)
+            except json.JSONDecodeError:
+                row[key] = None
     return row
 
 
