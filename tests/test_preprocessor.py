@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from app.config import FEATURE_COLS, N_INPUT_HOURS, N_FORECAST_HOURS
-from app.models.preprocessor import resample_hourly, clean, create_sequences
+from app.models.preprocessor import resample_hourly, clean, create_sequences, detect_and_remove_anomalies
 
 
 def test_resample_hourly_returns_24_rows(sample_minute_df):
@@ -43,9 +43,6 @@ def test_create_sequences_values_are_contiguous(sample_sequence_data):
     np.testing.assert_array_equal(y[0], sample_sequence_data[N_INPUT_HOURS:N_INPUT_HOURS + N_FORECAST_HOURS])
 
 
-from app.models.preprocessor import detect_and_remove_anomalies
-
-
 def test_detect_and_remove_anomalies_replaces_spike(sample_hourly_df):
     df = sample_hourly_df.copy()
     df.iloc[12, 0] = 99999.0  # extreme temporal spike
@@ -62,7 +59,7 @@ def test_detect_and_remove_anomalies_no_nans(sample_hourly_df):
 
 def test_detect_and_remove_anomalies_preserves_normal(sample_hourly_df):
     result = detect_and_remove_anomalies(sample_hourly_df)
-    # no more than 10% of values should change on normal data
-    changed = (result.values != sample_hourly_df.values).sum()
+    # no more than 10% of values should change significantly on normal data
+    changed = (~np.isclose(result.values, sample_hourly_df.values, atol=1e-6)).sum()
     total = sample_hourly_df.size
     assert changed / total < 0.1

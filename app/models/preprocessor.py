@@ -46,8 +46,8 @@ def resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
 def detect_and_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for col in df.columns:
-        rolling_median = df[col].rolling(24, min_periods=1, center=True).median()
-        rolling_std = df[col].rolling(24, min_periods=1, center=True).std().fillna(1.0)
+        rolling_median = df[col].rolling(N_INPUT_HOURS, min_periods=1, center=True).median()
+        rolling_std = df[col].rolling(N_INPUT_HOURS, min_periods=1, center=True).std().fillna(1.0)
         anomaly_mask = (df[col] - rolling_median).abs() > 3 * rolling_std
         df.loc[anomaly_mask, col] = np.nan
         df[col] = df[col].interpolate(method="linear").ffill().bfill()
