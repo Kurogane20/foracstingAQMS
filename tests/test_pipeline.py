@@ -13,6 +13,13 @@ def _make_mock_timestamps():
     return pd.date_range("2024-01-01", periods=24, freq="h")
 
 
+def _make_lgbm_dict():
+    point = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
+    lower = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
+    upper = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
+    return {"point": point, "lower": lower, "upper": upper}
+
+
 def test_run_prediction_returns_6_steps():
     from app.models.pipeline import run_prediction
     with patch("app.models.pipeline.preprocess_for_predict") as mock_pre, \
@@ -21,7 +28,7 @@ def test_run_prediction_returns_6_steps():
          patch("app.models.pipeline.denormalize") as mock_denorm:
         mock_pre.return_value = (_make_mock_X(), _make_mock_timestamps())
         mock_bilstm.return_value = np.random.randn(1, N_FORECAST_HOURS, len(FEATURE_COLS))
-        mock_lgbm.return_value = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
+        mock_lgbm.return_value = _make_lgbm_dict()
         mock_denorm.return_value = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
         result = run_prediction("test_uid")
     assert len(result) == N_FORECAST_HOURS
@@ -39,7 +46,7 @@ def test_run_prediction_step_numbers_are_sequential():
          patch("app.models.pipeline.denormalize") as mock_denorm:
         mock_pre.return_value = (_make_mock_X(), _make_mock_timestamps())
         mock_bilstm.return_value = np.random.randn(1, N_FORECAST_HOURS, len(FEATURE_COLS))
-        mock_lgbm.return_value = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
+        mock_lgbm.return_value = _make_lgbm_dict()
         mock_denorm.return_value = np.random.randn(N_FORECAST_HOURS, len(FEATURE_COLS))
         result = run_prediction("test_uid")
     steps = [r["step"] for r in result]
