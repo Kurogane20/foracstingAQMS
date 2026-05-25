@@ -14,21 +14,32 @@ def run_prediction(uid: str) -> list:
     X, timestamps = preprocess_for_predict(uid)
     last_time = timestamps[-1]
 
-    bilstm_out = predict_bilstm(X, uid)          # (1, 6, 14)
-    lgbm_out = predict_lgbm(bilstm_out[0], last_time, uid)  # (6, 14)
-    final = denormalize(lgbm_out, uid)            # (6, 14)
+    bilstm_out = predict_bilstm(X, uid)                         # (1, 6, 14)
+    lgbm_result = predict_lgbm(bilstm_out[0], last_time, uid)  # dict
+
+    final_point = denormalize(lgbm_result["point"], uid)        # (6, 14)
+    final_lower = denormalize(lgbm_result["lower"], uid) if lgbm_result.get("lower") is not None else None
+    final_upper = denormalize(lgbm_result["upper"], uid) if lgbm_result.get("upper") is not None else None
 
     results = []
     for step in range(N_FORECAST_HOURS):
         target_time = last_time + pd.Timedelta(hours=step + 1)
         row = {"step": step + 1, "target_time": target_time.isoformat()}
         for i, col in enumerate(FEATURE_COLS):
-            row[col] = float(final[step, i])
+            row[col] = float(final_point[step, i])
+        row["lower_bounds"] = (
+            {col: float(final_lower[step, i]) for i, col in enumerate(FEATURE_COLS)}
+            if final_lower is not None else None
+        )
+        row["upper_bounds"] = (
+            {col: float(final_upper[step, i]) for i, col in enumerate(FEATURE_COLS)}
+            if final_upper is not None else None
+        )
         results.append(row)
     return results
 
 
-def run_training(uid: str) -> dict:
+def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None) -> dict:
     X, y = preprocess_for_training(uid)
 
     if len(X) < 10:
@@ -38,20 +49,25 @@ def run_training(uid: str) -> dict:
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
 
-    train_bilstm(X_train, y_train, uid)
+    bilstm_kw = bilstm_params or {}
+    train_bilstm(X_train, y_train, uid, **bilstm_kw)
 
-    bilstm_preds_all = np.array([predict_bilstm(X[i : i + 1], uid)[0] for i in range(len(X))])
-    # Synthetic base_times for training — LGBm learns time-of-day patterns
-    # from hour/dayofweek/month features; exact calendar anchor does not affect fit quality.
-    base_times = [
-        pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i * N_INPUT_HOURS)
-        for i in range(len(X))
+    bilstm_preds_train = np.array([
+        predict_bilstm(X_train[i : i + 1], uid)[0]
+        for i in range(len(X_train))
+    ])
+    base_times_train = [
+        pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i)
+        for i in range(len(X_train))
     ]
-    train_lgbm(bilstm_preds_all, y, base_times, uid)
+    train_lgbm(bilstm_preds_train, y_train, base_times_train, uid, lgbm_params=lgbm_params)
 
-    val_bilstm = np.array([predict_bilstm(X_val[i : i + 1], uid)[0] for i in range(len(X_val))])
+    val_bilstm = np.array([
+        predict_bilstm(X_val[i : i + 1], uid)[0]
+        for i in range(len(X_val))
+    ])
     val_lgbm = np.array([
-        predict_lgbm(val_bilstm[i], base_times[split + i], uid)
+        predict_lgbm(val_bilstm[i], pd.Timestamp("2024-01-01") + pd.Timedelta(hours=split + i), uid)["point"]
         for i in range(len(X_val))
     ])
     mae = float(np.mean(np.abs(val_lgbm - y_val)))
