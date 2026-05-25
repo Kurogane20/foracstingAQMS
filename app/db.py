@@ -1,10 +1,19 @@
+import json
 from datetime import datetime
 import mysql.connector
-from app.config import DB_CONFIG
+from app.config import SENSOR_DB_CONFIG, RESULT_DB_CONFIG
+
+
+def _parse_bounds(row: dict) -> dict:
+    for key in ("lower_bounds", "upper_bounds"):
+        val = row.get(key)
+        if isinstance(val, str):
+            row[key] = json.loads(val)
+    return row
 
 
 def get_all_uids() -> list[str]:
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(**SENSOR_DB_CONFIG)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -16,7 +25,7 @@ def get_all_uids() -> list[str]:
 
 
 def get_latest_predictions(uid: str) -> list[dict]:
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute(
@@ -30,13 +39,41 @@ def get_latest_predictions(uid: str) -> list[dict]:
             """,
             (uid, uid),
         )
-        return [dict(r) for r in cursor.fetchall()]
+        return [_parse_bounds(dict(r)) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_all_latest_predictions() -> dict[str, list[dict]]:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT p.*
+            FROM predictions p
+            INNER JOIN (
+                SELECT uid, MAX(predicted_at) AS max_pa
+                FROM predictions
+                GROUP BY uid
+            ) latest ON p.uid = latest.uid AND p.predicted_at = latest.max_pa
+            ORDER BY p.uid, p.step ASC
+            """
+        )
+        rows = cursor.fetchall()
+        result: dict[str, list] = {}
+        for row in rows:
+            uid = row["uid"]
+            if uid not in result:
+                result[uid] = []
+            result[uid].append(_parse_bounds(dict(row)))
+        return result
     finally:
         conn.close()
 
 
 def get_model_status() -> list[dict]:
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT * FROM model_metadata ORDER BY uid")
@@ -54,7 +91,7 @@ def upsert_metadata(
     mae_score: float = None,
     error_message: str = None,
 ) -> None:
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -81,24 +118,26 @@ def upsert_metadata(
 
 def save_predictions(uid: str, predicted_at: datetime, predictions: list[dict]) -> None:
     from app.config import FEATURE_COLS
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor()
         cursor.execute(
             "DELETE FROM predictions WHERE uid = %s AND predicted_at = %s",
             (uid, predicted_at),
         )
-        cols_sql = ", ".join(FEATURE_COLS)
+        cols_sql = ", ".join(f"`{c}`" for c in FEATURE_COLS)
         placeholders = ", ".join(["%s"] * len(FEATURE_COLS))
         for pred in predictions:
             values = tuple(pred.get(c) for c in FEATURE_COLS)
+            lower = json.dumps(pred["lower_bounds"]) if pred.get("lower_bounds") is not None else None
+            upper = json.dumps(pred["upper_bounds"]) if pred.get("upper_bounds") is not None else None
             cursor.execute(
                 f"""
                 INSERT INTO predictions
-                    (uid, predicted_at, target_time, step, {cols_sql})
-                VALUES (%s, %s, %s, %s, {placeholders})
+                    (uid, predicted_at, target_time, step, {cols_sql}, lower_bounds, upper_bounds)
+                VALUES (%s, %s, %s, %s, {placeholders}, %s, %s)
                 """,
-                (uid, predicted_at, pred["target_time"], pred["step"], *values),
+                (uid, predicted_at, pred["target_time"], pred["step"], *values, lower, upper),
             )
         conn.commit()
     finally:
