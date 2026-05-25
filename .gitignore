@@ -5,3 +5,4 @@ __pycache__/
 venv/
 logs/*
 !logs/.gitkeep
+=3.6
