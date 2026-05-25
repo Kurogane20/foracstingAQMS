@@ -1,10 +1,10 @@
 import numpy as np
 import pytest
-from app.config import N_INPUT_HOURS, N_FORECAST_HOURS, FEATURE_COLS, SSA_WINDOW
+from app.config import N_INPUT_HOURS, N_FORECAST_HOURS, FEATURE_COLS, SSA_WINDOW, N_TIME_FEATURES
 from app.models.bilstm import build_bilstm
 from app.models.ssa import apply_ssa_to_dataframe
 
-N_SSA_FEATURES = len(FEATURE_COLS) * 2
+N_SSA_FEATURES = len(FEATURE_COLS) * 2 + N_TIME_FEATURES
 
 
 def test_bilstm_output_shape():

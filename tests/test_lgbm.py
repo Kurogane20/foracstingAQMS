@@ -54,3 +54,24 @@ def test_train_lgbm_creates_three_model_files(tmp_path, monkeypatch):
     assert (uid_dir / "lgbm.pkl").exists()
     assert (uid_dir / "lgbm_lower.pkl").exists()
     assert (uid_dir / "lgbm_upper.pkl").exists()
+
+
+def test_train_lgbm_accepts_custom_params(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.models.lgbm.MODELS_DIR", str(tmp_path))
+    N = 20
+    bilstm_preds = np.random.randn(N, N_FORECAST_HOURS, N_FEATURES)
+    y_true = np.random.randn(N, N_FORECAST_HOURS, N_FEATURES)
+    base_times = [pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i) for i in range(N)]
+    # Should complete without error with custom params
+    train_lgbm(bilstm_preds, y_true, base_times, "uid_custom",
+               lgbm_params={"n_estimators": 10, "learning_rate": 0.1})
+    assert (tmp_path / "uid_custom" / "lgbm.pkl").exists()
+
+
+def test_predict_lgbm_returns_none_for_missing_models(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.models.lgbm.MODELS_DIR", str(tmp_path))
+    bilstm_out = np.random.randn(N_FORECAST_HOURS, N_FEATURES)
+    result = predict_lgbm(bilstm_out, pd.Timestamp("2024-06-15 14:00:00"), "nonexistent_uid")
+    assert result["point"] is None
+    assert result["lower"] is None
+    assert result["upper"] is None
