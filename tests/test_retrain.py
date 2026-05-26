@@ -124,10 +124,51 @@ def test_retrain_sensor_runs_tuning_when_no_params_and_flag_set():
 
     mock_pre.assert_called_once_with(UID)
     mock_tune_b.assert_called_once()
+    mock_train_bilstm.assert_called_once()
     mock_tune_l.assert_called_once()
     mock_save.assert_called_once_with(UID, _BILSTM_PARAMS, _LGBM_PARAMS)
-    mock_train.assert_called_once_with(UID, bilstm_params=_BILSTM_PARAMS, lgbm_params=_LGBM_PARAMS)
+    # Tuning path must pass pre-fetched X/y to avoid scaler refit
+    mock_train.assert_called_once_with(
+        UID,
+        bilstm_params=_BILSTM_PARAMS,
+        lgbm_params=_LGBM_PARAMS,
+        X=_MOCK_X,
+        y=_MOCK_Y,
+    )
     assert result["status"] == "ready"
+
+
+def test_retrain_sensor_tuning_evicts_model_cache():
+    """After intermediate train_bilstm, _model_cache entry is evicted before predict_bilstm."""
+    eviction_order = []
+
+    def fake_train_bilstm(X, y, uid, **kw):
+        # Inject a stale entry so we can verify it gets popped
+        from app.models.bilstm import _model_cache
+        _model_cache[uid] = "stale_model"
+
+    def fake_predict_bilstm(x, uid):
+        from app.models.bilstm import _model_cache
+        eviction_order.append(uid in _model_cache)
+        return np.random.randn(1, 6, 14)
+
+    with patch("app.services.retrain.load_best_params", return_value=None), \
+         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y)), \
+         patch("app.services.retrain.tune_bilstm", return_value=_BILSTM_PARAMS), \
+         patch("app.services.retrain.train_bilstm", side_effect=fake_train_bilstm), \
+         patch("app.services.retrain.predict_bilstm", side_effect=fake_predict_bilstm), \
+         patch("app.services.retrain.tune_lgbm", return_value=_LGBM_PARAMS), \
+         patch("app.services.retrain.save_best_params"), \
+         patch("app.services.retrain.run_training", return_value=_MOCK_RESULT), \
+         patch("app.services.retrain.upsert_metadata"):
+        from app.services.retrain import retrain_sensor
+        retrain_sensor(UID, run_tuning=True)
+
+    # All predict_bilstm calls should have seen the cache as empty (evicted)
+    assert all(not present for present in eviction_order), (
+        "Expected _model_cache to be evicted before predict_bilstm calls, "
+        f"but cache presence was: {eviction_order}"
+    )
 
 
 # ---------------------------------------------------------------------------

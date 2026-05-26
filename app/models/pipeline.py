@@ -39,8 +39,10 @@ def run_prediction(uid: str) -> list:
     return results
 
 
-def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None) -> dict:
-    X, y = preprocess_for_training(uid)
+def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
+                 X: np.ndarray = None, y: np.ndarray = None) -> dict:
+    if X is None or y is None:
+        X, y = preprocess_for_training(uid)
 
     if len(X) < 10:
         raise ValueError(f"Insufficient data for {uid}: only {len(X)} sequences")

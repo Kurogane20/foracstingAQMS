@@ -6,7 +6,7 @@ from app.db import upsert_metadata
 from app.models.pipeline import run_training
 from app.models.preprocessor import preprocess_for_training
 from app.models.tuning import load_best_params, tune_bilstm, tune_lgbm, save_best_params
-from app.models.bilstm import predict_bilstm, train_bilstm
+from app.models.bilstm import predict_bilstm, train_bilstm, _model_cache
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
             X_train = X[:split]
             y_train = y[:split]
             train_bilstm(X_train, y_train, uid, **bilstm_params)
+            _model_cache.pop(uid, None)   # force reload of just-saved model
             bilstm_preds = np.array([
                 predict_bilstm(X_train[i:i + 1], uid)[0]
                 for i in range(len(X_train))
@@ -47,7 +48,10 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
             logger.info(f"[{uid}] Tuning complete, params saved")
 
         upsert_metadata(uid, status="training")
-        result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params)
+        if run_tuning and params is None:
+            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params, X=X, y=y)
+        else:
+            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params)
         trained_at = datetime.now(timezone.utc).replace(tzinfo=None)
         upsert_metadata(
             uid,
