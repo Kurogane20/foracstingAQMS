@@ -157,3 +157,72 @@ def test_get_all_latest_predictions_calls_parse_bounds():
 
     assert result["uid_test"][0]["lower_bounds"] == {"pm_25": 10.0}
     assert result["uid_test"][0]["upper_bounds"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_unresolved_predictions
+# ---------------------------------------------------------------------------
+
+def test_get_unresolved_predictions_returns_rows():
+    from app.db import get_unresolved_predictions
+    raw_row = {"uid": "s1", "target_time": datetime(2024, 1, 1, 10), "step": 1, "predicted_at": datetime(2024, 1, 1, 9)}
+    cursor_mock = MagicMock()
+    cursor_mock.fetchall.return_value = [raw_row]
+    conn_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        result = get_unresolved_predictions("s1")
+    assert len(result) == 1
+    assert result[0]["step"] == 1
+
+
+# ---------------------------------------------------------------------------
+# update_prediction_actuals
+# ---------------------------------------------------------------------------
+
+def test_update_prediction_actuals_executes_update():
+    import json as _json
+    from app.db import update_prediction_actuals
+    conn_mock, cursor_mock = _make_conn_mock()
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        update_prediction_actuals("s1", datetime(2024, 1, 1, 10), {"aqi_index": 55.0})
+    assert cursor_mock.execute.called
+    call_args = cursor_mock.execute.call_args[0]
+    assert "UPDATE" in call_args[0]
+    stored = call_args[1][0]
+    assert _json.loads(stored) == {"aqi_index": 55.0}
+
+
+# ---------------------------------------------------------------------------
+# get_resolved_predictions
+# ---------------------------------------------------------------------------
+
+def test_get_resolved_predictions_parses_actual_values():
+    from app.db import get_resolved_predictions
+    from app.config import FEATURE_COLS
+    import json as _json
+    raw_row = {"step": 1, "actual_values": _json.dumps({"aqi_index": 60.0})}
+    raw_row.update({c: 50.0 for c in FEATURE_COLS})
+    cursor_mock = MagicMock()
+    cursor_mock.fetchall.return_value = [raw_row]
+    conn_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        result = get_resolved_predictions("s1", n=10)
+    assert result[0]["actual_values"] == {"aqi_index": 60.0}
+
+
+# ---------------------------------------------------------------------------
+# update_drift_metadata
+# ---------------------------------------------------------------------------
+
+def test_update_drift_metadata_executes_update():
+    from app.db import update_drift_metadata
+    conn_mock, cursor_mock = _make_conn_mock()
+    ts = datetime(2024, 1, 2, 0, 0, 0)
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        update_drift_metadata("s1", 1.8, ts)
+    assert cursor_mock.execute.called
+    call_sql = cursor_mock.execute.call_args[0][0]
+    assert "UPDATE" in call_sql
+    assert "drift_score" in call_sql

@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 import mysql.connector
-from app.config import SENSOR_DB_CONFIG, RESULT_DB_CONFIG
+from app.config import SENSOR_DB_CONFIG, RESULT_DB_CONFIG, FEATURE_COLS
 
 
 def _parse_bounds(row: dict) -> dict:
@@ -121,7 +121,6 @@ def upsert_metadata(
 
 
 def save_predictions(uid: str, predicted_at: datetime, predictions: list[dict]) -> None:
-    from app.config import FEATURE_COLS
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor()
@@ -143,6 +142,92 @@ def save_predictions(uid: str, predicted_at: datetime, predictions: list[dict]) 
                 """,
                 (uid, predicted_at, pred["target_time"], pred["step"], *values, lower, upper),
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unresolved_predictions(uid: str) -> list[dict]:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT uid, target_time, step, predicted_at
+            FROM predictions
+            WHERE uid = %s AND target_time <= NOW() AND actual_values IS NULL
+            ORDER BY target_time ASC
+            """,
+            (uid,),
+        )
+        return [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def update_prediction_actuals(uid: str, target_time, actual_values: dict) -> None:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE predictions
+            SET actual_values = %s
+            WHERE uid = %s AND target_time = %s AND actual_values IS NULL
+            """,
+            (json.dumps(actual_values), uid, target_time),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_resolved_predictions(uid: str, n: int = 100) -> list[dict]:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cols_sql = ", ".join(f"`{c}`" for c in FEATURE_COLS)
+        cursor.execute(
+            f"""
+            SELECT step, {cols_sql}, actual_values
+            FROM predictions
+            WHERE uid = %s AND actual_values IS NOT NULL
+            ORDER BY target_time DESC
+            LIMIT %s
+            """,
+            (uid, n),
+        )
+        rows = []
+        for r in cursor.fetchall():
+            row = dict(r)
+            val = row.get("actual_values")
+            if isinstance(val, str):
+                try:
+                    row["actual_values"] = json.loads(val)
+                except json.JSONDecodeError:
+                    row["actual_values"] = None
+            rows.append(row)
+        return rows
+    finally:
+        conn.close()
+
+
+def update_drift_metadata(
+    uid: str,
+    drift_score: float | None,
+    last_accuracy_check_at,
+) -> None:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE model_metadata
+            SET drift_score = %s, last_accuracy_check_at = %s
+            WHERE uid = %s
+            """,
+            (drift_score, last_accuracy_check_at, uid),
+        )
         conn.commit()
     finally:
         conn.close()
