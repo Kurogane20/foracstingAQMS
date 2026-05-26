@@ -20,7 +20,7 @@ def retrain_one(uid: str, background_tasks: BackgroundTasks):
     return {"message": f"Retrain queued for {uid}"}
 
 
-@router.post("/tune/{uid}", status_code=202)
+@router.post("/tune/{uid}", status_code=202, dependencies=[Depends(require_api_key)])
 async def trigger_tune(uid: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(retrain_sensor, uid, run_tuning=True)
     return {"status": "accepted", "uid": uid}
