@@ -217,9 +217,10 @@ def get_prediction_history(uid: str, days: int = 7) -> list[dict]:
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor(dictionary=True)
+        cols_sql = ", ".join(f"`{c}`" for c in FEATURE_COLS)
         cursor.execute(
             f"""
-            SELECT step, target_time, predicted_at, {', '.join(FEATURE_COLS)}
+            SELECT step, target_time, predicted_at, {cols_sql}
             FROM predictions
             WHERE uid = %s
               AND predicted_at >= NOW() - INTERVAL %s DAY
