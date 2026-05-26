@@ -113,6 +113,12 @@ def test_detect_drift_returns_none_when_no_baseline():
     assert ratio is None
 
 
+def test_detect_drift_returns_none_when_baseline_zero():
+    from app.services.accuracy import detect_drift
+    ratio = detect_drift(UID, baseline_mae=0.0)
+    assert ratio is None
+
+
 def test_detect_drift_returns_none_when_insufficient_data():
     from app.services.accuracy import detect_drift, DRIFT_WINDOW
     rows = [_make_resolved_row(step=1) for _ in range(DRIFT_WINDOW - 1)]

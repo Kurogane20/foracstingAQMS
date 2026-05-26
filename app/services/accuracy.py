@@ -23,6 +23,7 @@ def fetch_actual_for_step(uid: str, target_time: datetime) -> dict | None:
     target_unix = int(target_time.timestamp())
     window_secs = 1800
     conn = mysql.connector.connect(**SENSOR_DB_CONFIG)
+    cursor = None
     try:
         cursor = conn.cursor(dictionary=True)
         cols_sql = ", ".join(FEATURE_COLS)
@@ -38,6 +39,8 @@ def fetch_actual_for_step(uid: str, target_time: datetime) -> dict | None:
             return None
         return {k: float(v) for k, v in row.items() if v is not None}
     finally:
+        if cursor is not None:
+            cursor.close()
         conn.close()
 
 
@@ -80,13 +83,16 @@ def compute_accuracy(uid: str) -> dict:
             for col, errs in col_errors.items()
         }
         all_errors.extend(e for errs in col_errors.values() for e in errs)
-    if all_errors:
-        result["overall_mae"] = round(float(np.mean(all_errors)), 4)
+    if not all_errors:
+        return {}
+    result["overall_mae"] = round(float(np.mean(all_errors)), 4)
     return result
 
 
 def detect_drift(uid: str, baseline_mae: float | None) -> float | None:
-    if not baseline_mae:
+    if baseline_mae is None:
+        return None
+    if baseline_mae == 0.0:
         return None
     rows = get_resolved_predictions(uid, n=DRIFT_WINDOW)
     if len(rows) < DRIFT_WINDOW:
