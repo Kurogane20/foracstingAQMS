@@ -229,3 +229,41 @@ def test_update_drift_metadata_executes_update():
     assert "UPDATE" in call_sql
     assert "drift_score" in call_sql
     assert call_params == (1.8, ts, "s1")
+
+
+# ---------------------------------------------------------------------------
+# get_prediction_history
+# ---------------------------------------------------------------------------
+
+def test_get_prediction_history_returns_list():
+    from app.db import get_prediction_history
+    from datetime import datetime
+    ts = datetime(2024, 1, 1, 12, 0, 0)
+    from app.config import FEATURE_COLS
+    row = {
+        "step": 1,
+        "target_time": ts,
+        "predicted_at": ts,
+        **{col: 50.0 for col in FEATURE_COLS},
+    }
+    conn_mock = MagicMock()
+    cursor_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    cursor_mock.fetchall.return_value = [row]
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        result = get_prediction_history("uid_001", days=7)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["step"] == 1
+    assert isinstance(result[0]["target_time"], str)  # serialized to ISO
+
+
+def test_get_prediction_history_empty_returns_list():
+    from app.db import get_prediction_history
+    conn_mock = MagicMock()
+    cursor_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    cursor_mock.fetchall.return_value = []
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        result = get_prediction_history("uid_001", days=7)
+    assert result == []

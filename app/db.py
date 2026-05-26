@@ -213,6 +213,32 @@ def get_resolved_predictions(uid: str, n: int = 100) -> list[dict]:
         conn.close()
 
 
+def get_prediction_history(uid: str, days: int = 7) -> list[dict]:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT step, target_time, predicted_at, {', '.join(FEATURE_COLS)}
+            FROM predictions
+            WHERE uid = %s
+              AND predicted_at >= NOW() - INTERVAL %s DAY
+            ORDER BY predicted_at ASC, step ASC
+            """,
+            (uid, days),
+        )
+        rows = []
+        for r in cursor.fetchall():
+            row = dict(r)
+            for k, v in row.items():
+                if isinstance(v, datetime):
+                    row[k] = v.isoformat()
+            rows.append(row)
+        return rows
+    finally:
+        conn.close()
+
+
 def update_drift_metadata(
     uid: str,
     drift_score: float | None,
