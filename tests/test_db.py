@@ -223,6 +223,9 @@ def test_update_drift_metadata_executes_update():
     with patch("app.db.mysql.connector.connect", return_value=conn_mock):
         update_drift_metadata("s1", 1.8, ts)
     assert cursor_mock.execute.called
-    call_sql = cursor_mock.execute.call_args[0][0]
+    call_args = cursor_mock.execute.call_args[0]
+    call_sql = call_args[0]
+    call_params = call_args[1]
     assert "UPDATE" in call_sql
     assert "drift_score" in call_sql
+    assert call_params == (1.8, ts, "s1")

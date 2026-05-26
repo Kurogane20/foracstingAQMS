@@ -165,7 +165,7 @@ def get_unresolved_predictions(uid: str) -> list[dict]:
         conn.close()
 
 
-def update_prediction_actuals(uid: str, target_time, actual_values: dict) -> None:
+def update_prediction_actuals(uid: str, target_time, actual_values: dict) -> int:
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor()
@@ -178,6 +178,7 @@ def update_prediction_actuals(uid: str, target_time, actual_values: dict) -> Non
             (json.dumps(actual_values), uid, target_time),
         )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
 
@@ -189,7 +190,7 @@ def get_resolved_predictions(uid: str, n: int = 100) -> list[dict]:
         cols_sql = ", ".join(f"`{c}`" for c in FEATURE_COLS)
         cursor.execute(
             f"""
-            SELECT step, {cols_sql}, actual_values
+            SELECT step, target_time, {cols_sql}, actual_values
             FROM predictions
             WHERE uid = %s AND actual_values IS NOT NULL
             ORDER BY target_time DESC
@@ -216,7 +217,7 @@ def update_drift_metadata(
     uid: str,
     drift_score: float | None,
     last_accuracy_check_at,
-) -> None:
+) -> int:
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor()
@@ -229,5 +230,6 @@ def update_drift_metadata(
             (drift_score, last_accuracy_check_at, uid),
         )
         conn.commit()
+        return cursor.rowcount
     finally:
         conn.close()
