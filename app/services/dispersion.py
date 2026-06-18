@@ -37,26 +37,21 @@ def _stability_class(
         if cloudcover < 30:
             # strong insolation
             if wind_speed < 2:  return "A"
-            if wind_speed < 3:  return "B"
             if wind_speed < 5:  return "B"
-            if wind_speed < 6:  return "C"
             return "C"
         elif cloudcover < 70:
             # moderate insolation
-            if wind_speed < 2:  return "B"
             if wind_speed < 3:  return "B"
             if wind_speed < 5:  return "C"
-            if wind_speed < 6:  return "D"
             return "D"
         else:
             # slight insolation / overcast
             if wind_speed < 5:  return "C"
             return "D"
     else:
-        # nighttime
+        # nighttime: overcast threshold is 60% (stricter than daytime 70%) per PG night criteria
         if cloudcover > 60:
-            return "D"         # overcast night → near-neutral
-        if wind_speed < 2:  return "F"
+            return "D"
         if wind_speed < 3:  return "F"
         if wind_speed < 5:  return "E"
         return "D"
@@ -129,7 +124,7 @@ def _plume_conc(
     yp = y_cross[mask]
 
     sigma_y = ay * xp * (1.0 + 1e-4 * xp) ** (-0.5)
-    sigma_z = az * xp
+    sigma_z = az * xp  # linear form; underestimates σ_z for class A at x > 500 m
 
     denom = math.pi * max(u, 0.5) * sigma_y * sigma_z + 1e-12
     result[mask] = (2.0 * Q / denom) * np.exp(-0.5 * (yp / (sigma_y + 1e-12)) ** 2)
