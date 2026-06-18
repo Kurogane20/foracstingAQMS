@@ -9,6 +9,7 @@ M_PER_LAT = 111_000.0  # meters per degree latitude
 
 # Pasquill-Gifford (ay, az) dispersion coefficients by stability class
 _PG: dict[str, tuple[float, float]] = {
+    "A": (0.22, 0.20),
     "B": (0.16, 0.12),
     "C": (0.11, 0.08),
     "D": (0.08, 0.06),
@@ -17,36 +18,73 @@ _PG: dict[str, tuple[float, float]] = {
 }
 
 
-def _stability_class(wind_speed: float) -> str:
-    if wind_speed < 2:
-        return "F"
-    if wind_speed < 3:
-        return "E"
-    if wind_speed < 5:
+def _stability_class(
+    wind_speed: float,
+    cloudcover: float = 50.0,
+    local_hour: int = 12,
+) -> str:
+    """
+    Pasquill-Gifford atmospheric stability class (A–F).
+    Args:
+        wind_speed: m/s at 10m
+        cloudcover: 0–100 % cloud cover (Open-Meteo)
+        local_hour: 0–23 local clock hour at sensor location
+    Day = 06:00–17:59; insolation proxy: cloudcover < 30 strong, 30–70 moderate, > 70 slight.
+    """
+    is_day = 6 <= local_hour < 18
+
+    if is_day:
+        if cloudcover < 30:
+            # strong insolation
+            if wind_speed < 2:  return "A"
+            if wind_speed < 3:  return "B"
+            if wind_speed < 5:  return "B"
+            if wind_speed < 6:  return "C"
+            return "C"
+        elif cloudcover < 70:
+            # moderate insolation
+            if wind_speed < 2:  return "B"
+            if wind_speed < 3:  return "B"
+            if wind_speed < 5:  return "C"
+            if wind_speed < 6:  return "D"
+            return "D"
+        else:
+            # slight insolation / overcast
+            if wind_speed < 5:  return "C"
+            return "D"
+    else:
+        # nighttime
+        if cloudcover > 60:
+            return "D"         # overcast night → near-neutral
+        if wind_speed < 2:  return "F"
+        if wind_speed < 3:  return "F"
+        if wind_speed < 5:  return "E"
         return "D"
-    if wind_speed < 6:
-        return "C"
-    return "B"
 
 
 async def _fetch_wind(lat: float, lng: float, client: httpx.AsyncClient) -> dict:
-    """Fetch current wind speed + direction from Open-Meteo (free, no API key)."""
+    """Fetch current wind, cloudcover, and local hour from Open-Meteo (free, no key)."""
     resp = await client.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": lat,
             "longitude": lng,
-            "current": "wind_speed_10m,wind_direction_10m",
+            "current": "wind_speed_10m,wind_direction_10m,cloudcover",
             "wind_speed_unit": "ms",
             "timezone": "auto",
         },
         timeout=10.0,
     )
     resp.raise_for_status()
-    current = resp.json().get("current", {})
+    data = resp.json()
+    current = data.get("current", {})
+    time_str = current.get("time", "")       # e.g. "2024-01-15T14:00"
+    local_hour = int(time_str[11:13]) if len(time_str) >= 13 else 12
     return {
-        "speed":     max(float(current.get("wind_speed_10m", 1.0)), 0.5),
-        "direction": float(current.get("wind_direction_10m", 0.0)),
+        "speed":      max(float(current.get("wind_speed_10m", 1.0)), 0.5),
+        "direction":  float(current.get("wind_direction_10m", 0.0)),
+        "cloudcover": float(current.get("cloudcover", 50.0)),
+        "hour":       local_hour,
     }
 
 
@@ -127,7 +165,7 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
 
     # Replace failed fetches with a calm-wind default
     wind_data = [
-        w if isinstance(w, dict) else {"speed": 2.0, "direction": 0.0}
+        w if isinstance(w, dict) else {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "hour": 12}
         for w in wind_results
     ]
 
@@ -157,7 +195,7 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
     for s, w in zip(sensors, wind_data):
         Q = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
         u    = w["speed"]
-        stab = _stability_class(u)
+        stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
 
         dlat = lat_grid - s["lat"]
         dlng = lng_grid - s["lng"]
