@@ -142,6 +142,7 @@ def preprocess_for_predict(uid: str) -> tuple:
         try:
             meteo_df = fetch_meteo_predict(loc["lat"], loc["lng"], df_norm.index)
             df_norm = pd.concat([df_norm, meteo_df], axis=1)
+            logger.info(f"[{uid}] Meteo features merged: {len(meteo_df)} rows")
         except Exception as e:
             logger.warning(f"[{uid}] Meteo predict fetch failed ({e}); using neutral defaults")
             for col in METEO_COLS:
