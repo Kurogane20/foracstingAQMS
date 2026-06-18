@@ -1,14 +1,18 @@
+import logging
 import math
 import httpx
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 
 def _build_meteo_df(data: dict) -> pd.DataFrame:
     hourly = data.get("hourly", {})
-    times = pd.to_datetime(hourly["time"])
-    wind_speeds  = [s or 0.0 for s in hourly["wind_speed_10m"]]
-    wind_dirs    = [d or 0.0 for d in hourly["wind_direction_10m"]]
-    cloudcovers  = [c or 0.0 for c in hourly["cloudcover"]]
+    raw_times = pd.to_datetime(hourly["time"])
+    times = raw_times.tz_convert(None) if raw_times.tz is not None else raw_times
+    wind_speeds  = pd.Series(hourly["wind_speed_10m"]).fillna(0.0).values
+    wind_dirs    = pd.Series(hourly["wind_direction_10m"]).fillna(0.0).values
+    cloudcovers  = pd.Series(hourly["cloudcover"]).fillna(0.0).values
     return pd.DataFrame(
         {
             "meteo_wind_speed":   [min(s / 20.0, 1.0) for s in wind_speeds],
@@ -18,6 +22,16 @@ def _build_meteo_df(data: dict) -> pd.DataFrame:
         },
         index=times,
     )
+
+
+def _reindex_and_warn(df: pd.DataFrame, timestamps: pd.DatetimeIndex, context: str) -> pd.DataFrame:
+    reindexed = df.reindex(timestamps, method="nearest", tolerance=pd.Timedelta("61min"))
+    n_missing = int(reindexed.isnull().any(axis=1).sum())
+    if n_missing > len(timestamps) * 0.1:
+        logger.warning(
+            f"[meteo/{context}] {n_missing}/{len(timestamps)} timestamps unmatched — filling with zeros"
+        )
+    return reindexed.fillna(0.0)
 
 
 def fetch_meteo_training(lat: float, lng: float, timestamps: pd.DatetimeIndex) -> pd.DataFrame:
@@ -38,13 +52,16 @@ def fetch_meteo_training(lat: float, lng: float, timestamps: pd.DatetimeIndex) -
                 "end_date":        end,
                 "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
                 "wind_speed_unit": "ms",
-                "timezone":        "auto",
+                "timezone":        "UTC",
             },
             timeout=60.0,
         )
     resp.raise_for_status()
-    df = _build_meteo_df(resp.json())
-    return df.reindex(timestamps, method="nearest", tolerance=pd.Timedelta("61min")).fillna(0.0)
+    data = resp.json()
+    if data.get("error"):
+        raise ValueError(f"Open-Meteo error: {data.get('reason', data)}")
+    df = _build_meteo_df(data)
+    return _reindex_and_warn(df, timestamps, "training")
 
 
 def fetch_meteo_predict(lat: float, lng: float, timestamps: pd.DatetimeIndex) -> pd.DataFrame:
@@ -61,12 +78,15 @@ def fetch_meteo_predict(lat: float, lng: float, timestamps: pd.DatetimeIndex) ->
                 "longitude":       lng,
                 "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
                 "wind_speed_unit": "ms",
-                "timezone":        "auto",
+                "timezone":        "UTC",
                 "forecast_days":   1,
                 "past_days":       2,
             },
             timeout=15.0,
         )
     resp.raise_for_status()
-    df = _build_meteo_df(resp.json())
-    return df.reindex(timestamps, method="nearest", tolerance=pd.Timedelta("61min")).fillna(0.0)
+    data = resp.json()
+    if data.get("error"):
+        raise ValueError(f"Open-Meteo error: {data.get('reason', data)}")
+    df = _build_meteo_df(data)
+    return _reindex_and_warn(df, timestamps, "predict")
