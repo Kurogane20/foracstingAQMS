@@ -144,7 +144,7 @@ def get_sensor_lat_lng(uid: str) -> dict | None:
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT lat, lng FROM model_metadata WHERE uid = %s", (uid,))
         row = cursor.fetchone()
-        if not row or row.get("lat") is None:
+        if not row or row.get("lat") is None or row.get("lng") is None:
             return None
         return {"lat": float(row["lat"]), "lng": float(row["lng"])}
     finally:
