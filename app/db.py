@@ -120,6 +120,37 @@ def upsert_metadata(
         conn.close()
 
 
+def upsert_lat_lng(uid: str, lat: float, lng: float) -> None:
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO model_metadata (uid, status, lat, lng)
+            VALUES (%s, 'untrained', %s, %s)
+            ON DUPLICATE KEY UPDATE lat = VALUES(lat), lng = VALUES(lng)
+            """,
+            (uid, lat, lng),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_sensor_lat_lng(uid: str) -> dict | None:
+    """Return {"lat": float, "lng": float} or None if not stored yet."""
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT lat, lng FROM model_metadata WHERE uid = %s", (uid,))
+        row = cursor.fetchone()
+        if not row or row.get("lat") is None:
+            return None
+        return {"lat": float(row["lat"]), "lng": float(row["lng"])}
+    finally:
+        conn.close()
+
+
 def save_predictions(uid: str, predicted_at: datetime, predictions: list[dict]) -> None:
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
