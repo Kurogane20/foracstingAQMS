@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -6,22 +7,58 @@ from tensorflow.keras.layers import Bidirectional, LSTM, Dropout, Dense, Reshape
 from tensorflow.keras.callbacks import EarlyStopping
 from app.config import (
     BILSTM_UNITS, N_INPUT_HOURS, N_FORECAST_HOURS,
-    N_FEATURES, N_TIME_FEATURES, MODELS_DIR,
+    N_FEATURES, N_TIME_FEATURES, N_METEO_FEATURES, MODELS_DIR,
 )
 from app.models.ssa import apply_ssa_to_dataframe
+from app.training_progress import set_phase
 
-# SSA doubles sensor features; time features appended raw
-N_SSA_FEATURES = N_FEATURES * 2 + N_TIME_FEATURES  # 28 + 4 = 32
+# SSA doubles sensor features; time + meteo features pass through raw (no SSA)
+N_SSA_FEATURES = N_FEATURES * 2 + N_TIME_FEATURES + N_METEO_FEATURES  # 28 + 4 + 4 = 36
 
 _model_cache: dict[str, tf.keras.Model] = {}
 
 
+class _ProgressCallback(tf.keras.callbacks.Callback):
+    """Updates training_progress for a uid on each epoch end."""
+
+    def __init__(self, uid: str, total_epochs: int) -> None:
+        super().__init__()
+        self._uid = uid
+        self._total = max(total_epochs, 1)
+        self._start: float = 0.0
+
+    def on_train_begin(self, logs=None):
+        self._start = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        elapsed = time.time() - self._start
+        epochs_done = epoch + 1
+        # BiLSTM phase occupies 5%–84% of overall progress
+        pct = int(5 + (epochs_done / self._total) * 79)
+        eta = int((elapsed / epochs_done) * (self._total - epochs_done)) if epochs_done > 0 else None
+        set_phase(
+            self._uid,
+            phase="bilstm",
+            percent=min(pct, 84),
+            epoch=epochs_done,
+            total_epochs=self._total,
+            eta_seconds=eta,
+        )
+
+
 def _prepare_input(X: np.ndarray) -> np.ndarray:
-    """Apply SSA to sensor columns only, then concat time features."""
-    X_sensor = X[:, :, :N_FEATURES]                                     # (N, 24, 14)
-    X_time   = X[:, :, N_FEATURES:N_FEATURES + N_TIME_FEATURES]         # (N, 24,  4)
+    """
+    Apply SSA to sensor columns only, then concat time and meteo features.
+    X shape: (N, 24, 22)  — [sensor(14) | time(4) | meteo(4)]
+    Output:  (N, 24, 36)  — [ssa_sensor(28) | time(4) | meteo(4)]
+    """
+    n_time_end  = N_FEATURES + N_TIME_FEATURES            # 18
+    n_meteo_end = n_time_end + N_METEO_FEATURES           # 22
+    X_sensor = X[:, :, :N_FEATURES]                       # (N, 24, 14)
+    X_time   = X[:, :, N_FEATURES:n_time_end]             # (N, 24,  4)
+    X_meteo  = X[:, :, n_time_end:n_meteo_end]            # (N, 24,  4)
     X_ssa    = np.array([apply_ssa_to_dataframe(x) for x in X_sensor])  # (N, 24, 28)
-    return np.concatenate([X_ssa, X_time], axis=2)                      # (N, 24, 32)
+    return np.concatenate([X_ssa, X_time, X_meteo], axis=2)             # (N, 24, 36)
 
 
 def build_bilstm(units: int = BILSTM_UNITS, dropout: float = 0.2) -> tf.keras.Model:
@@ -59,12 +96,13 @@ def train_bilstm(
             f"Need at least 10 training samples for validation_split=0.1, got {len(X_prepared)}"
         )
     early_stop = EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True)
+    progress_cb = _ProgressCallback(uid=uid, total_epochs=epochs)
     model.fit(
         X_prepared, y,
         epochs=epochs,
         batch_size=batch_size,
         validation_split=0.1,
-        callbacks=[early_stop],
+        callbacks=[early_stop, progress_cb],
         verbose=1,
     )
     model_path = os.path.join(MODELS_DIR, uid, "bilstm.keras")
