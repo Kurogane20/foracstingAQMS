@@ -12,6 +12,7 @@ from app.db import get_model_status
 from app.routers.prediction import router as prediction_router
 from app.routers.training import router as training_router
 from app.routers.accuracy import router as accuracy_router
+from app.routers.dispersion import router as dispersion_router
 from app.config import LOGS_DIR
 
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -25,6 +26,7 @@ app = FastAPI(title="Air Quality Forecast API", version="1.0.0")
 app.include_router(prediction_router)
 app.include_router(training_router)
 app.include_router(accuracy_router)
+app.include_router(dispersion_router)
 
 
 def _hourly_predict_worker() -> None:
