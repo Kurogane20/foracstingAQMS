@@ -1,14 +1,17 @@
 import os
+import logging
 import numpy as np
 import pandas as pd
 import joblib
 import mysql.connector
 from sklearn.preprocessing import MinMaxScaler
 from app.config import (
-    SENSOR_DB_CONFIG, FEATURE_COLS, TIME_COLS,
+    SENSOR_DB_CONFIG, FEATURE_COLS, TIME_COLS, METEO_COLS,
     N_FEATURES, N_INPUT_HOURS, N_FORECAST_HOURS,
     TRAIN_HISTORY_HOURS, MODELS_DIR,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def fetch_sensor_data(uid: str, hours: int = N_INPUT_HOURS) -> pd.DataFrame:
@@ -131,7 +134,22 @@ def preprocess_for_predict(uid: str) -> tuple:
     df_clean = clean(df_clean)
     df_timed = add_time_features(df_clean)
     df_norm, _ = normalize(df_timed, uid, fit=False)
-    X = df_norm.values[-N_INPUT_HOURS:][np.newaxis, :, :]  # (1, 24, 18)
+    # Append meteo features for prediction window
+    from app.db import get_sensor_lat_lng
+    from app.services.meteo import fetch_meteo_predict
+    loc = get_sensor_lat_lng(uid)
+    if loc:
+        try:
+            meteo_df = fetch_meteo_predict(loc["lat"], loc["lng"], df_norm.index)
+            df_norm = pd.concat([df_norm, meteo_df], axis=1)
+        except Exception as e:
+            logger.warning(f"[{uid}] Meteo predict fetch failed ({e}); using neutral defaults")
+            for col in METEO_COLS:
+                df_norm[col] = 0.0
+    else:
+        for col in METEO_COLS:
+            df_norm[col] = 0.0
+    X = df_norm.values[-N_INPUT_HOURS:][np.newaxis, :, :]  # (1, 24, 22)
     return X, df_norm.index[-N_INPUT_HOURS:]
 
 
@@ -142,5 +160,22 @@ def preprocess_for_training(uid: str) -> tuple:
     df_clean  = clean(df_clean)
     df_timed  = add_time_features(df_clean)
     df_norm, _ = normalize(df_timed, uid, fit=True)
+    # Append meteo features (fetched per-uid lat/lng stored at retrain time)
+    from app.db import get_sensor_lat_lng
+    from app.services.meteo import fetch_meteo_training
+    loc = get_sensor_lat_lng(uid)
+    if loc:
+        try:
+            meteo_df = fetch_meteo_training(loc["lat"], loc["lng"], df_norm.index)
+            df_norm = pd.concat([df_norm, meteo_df], axis=1)
+            logger.info(f"[{uid}] Meteo features merged: {len(meteo_df)} rows")
+        except Exception as e:
+            logger.warning(f"[{uid}] Meteo fetch failed ({e}); using neutral defaults")
+            for col in METEO_COLS:
+                df_norm[col] = 0.0
+    else:
+        logger.warning(f"[{uid}] No lat/lng stored; meteo features set to neutral")
+        for col in METEO_COLS:
+            df_norm[col] = 0.0
     return create_sequences(df_norm.values, N_INPUT_HOURS, N_FORECAST_HOURS,
                             n_target_cols=N_FEATURES)
