@@ -18,14 +18,14 @@ def _build_meteo_df(data: dict) -> pd.DataFrame:
             "meteo_wind_speed":   [min(s / 20.0, 1.0) for s in wind_speeds],
             "meteo_wind_dir_sin": [math.sin(math.radians(d)) for d in wind_dirs],
             "meteo_wind_dir_cos": [math.cos(math.radians(d)) for d in wind_dirs],
-            "meteo_cloudcover":   [c / 100.0 for c in cloudcovers],
+            "meteo_cloudcover":   [min(c / 100.0, 1.0) for c in cloudcovers],
         },
         index=times,
     )
 
 
 def _reindex_and_warn(df: pd.DataFrame, timestamps: pd.DatetimeIndex, context: str) -> pd.DataFrame:
-    reindexed = df.reindex(timestamps, method="nearest", tolerance=pd.Timedelta("61min"))
+    reindexed = df.reindex(timestamps, method="nearest", tolerance=pd.Timedelta(minutes=61))
     n_missing = int(reindexed.isnull().any(axis=1).sum())
     if n_missing > len(timestamps) * 0.1:
         logger.warning(
