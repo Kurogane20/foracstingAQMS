@@ -131,6 +131,143 @@ def _plume_conc(
     return result
 
 
+async def _fetch_wind_forecast(
+    lat: float, lng: float, hours: int, client: httpx.AsyncClient
+) -> list[dict]:
+    """
+    Fetch hourly wind forecast for hour indices 0..hours from Open-Meteo.
+    Returns list of {speed, direction, cloudcover, hour, label_time} dicts.
+    """
+    resp = await client.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude":        lat,
+            "longitude":       lng,
+            "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
+            "wind_speed_unit": "ms",
+            "timezone":        "auto",
+            "forecast_days":   1,
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    hourly = resp.json().get("hourly", {})
+    times  = hourly.get("time", [])
+    speeds = hourly.get("wind_speed_10m", [])
+    dirs   = hourly.get("wind_direction_10m", [])
+    clouds = hourly.get("cloudcover", [])
+
+    result = []
+    for i in range(min(hours + 1, len(times))):
+        t = times[i]                                     # e.g. "2024-01-15T14:00"
+        local_hour = int(t[11:13]) if len(t) >= 13 else 12
+        label_time = t[11:16]      if len(t) >= 16 else "00:00"
+        result.append({
+            "speed":      max(float(speeds[i] or 1.0), 0.5),
+            "direction":  float(dirs[i]   or 0.0),
+            "cloudcover": float(clouds[i] or 50.0),
+            "hour":       local_hour,
+            "label_time": label_time,
+        })
+    return result
+
+
+_NEUTRAL_HOUR = {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "hour": 12, "label_time": "00:00"}
+
+
+async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> dict:
+    """
+    Compute Gaussian plume for hours 0..6, returning one frame per hour.
+
+    Each sensor dict: {"uid", "lat", "lng", "pm25", "tsp"}
+
+    Returns:
+        {
+            "frames": [
+                {
+                    "hour_offset": 0,
+                    "label": "Sekarang  14:00",
+                    "grid": [[lat, lng, intensity], ...],
+                    "wind_vectors": [{"uid","lat","lng","speed","direction"}, ...]
+                },
+                ...  # 7 items total (H+0 through H+6)
+            ]
+        }
+    """
+    if not sensors:
+        return {"frames": []}
+
+    # Fetch hourly forecast for all sensors in parallel
+    async with httpx.AsyncClient() as client:
+        fetch_results = await asyncio.gather(
+            *[_fetch_wind_forecast(s["lat"], s["lng"], hours, client) for s in sensors],
+            return_exceptions=True,
+        )
+
+    neutral_all = [_NEUTRAL_HOUR] * (hours + 1)
+    hourly_per_sensor = [
+        fw if isinstance(fw, list) and fw else neutral_all
+        for fw in fetch_results
+    ]
+
+    # Shared grid covering all sensors ± EXTENT degrees
+    EXTENT = 0.25
+    STEP   = 0.008
+
+    lats = [s["lat"] for s in sensors]
+    lngs = [s["lng"] for s in sensors]
+    lat_vals = np.arange(min(lats) - EXTENT, max(lats) + EXTENT + STEP, STEP)
+    lng_vals = np.arange(min(lngs) - EXTENT, max(lngs) + EXTENT + STEP, STEP)
+    lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
+
+    frames = []
+    for h in range(hours + 1):
+        total = np.zeros(lat_grid.shape, dtype=np.float64)
+        wind_vectors = []
+
+        for s, hw in zip(sensors, hourly_per_sensor):
+            w    = hw[h] if h < len(hw) else hw[-1]
+            Q    = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
+            u    = w["speed"]
+            stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+
+            dlat = lat_grid - s["lat"]
+            dlng = lng_grid - s["lng"]
+            x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
+            total += _plume_conc(x_down, y_cross, Q, u, stab)
+
+            wind_vectors.append({
+                "uid":       s["uid"],
+                "lat":       s["lat"],
+                "lng":       s["lng"],
+                "speed":     w["speed"],
+                "direction": w["direction"],
+            })
+
+        peak = total.max()
+        if peak > 0:
+            total /= peak
+
+        THRESHOLD = 0.02
+        rows, cols = np.where(total >= THRESHOLD)
+        grid = [
+            [round(float(lat_grid[r, c]), 5), round(float(lng_grid[r, c]), 5), round(float(total[r, c]), 3)]
+            for r, c in zip(rows, cols)
+        ]
+
+        label_time = hourly_per_sensor[0][h]["label_time"] if hourly_per_sensor else "00:00"
+        label = f"Sekarang  {label_time}" if h == 0 else f"H+{h}  {label_time}"
+
+        frames.append({
+            "hour_offset":  h,
+            "label":        label,
+            "grid":         grid,
+            "wind_vectors": wind_vectors,
+        })
+
+    return {"frames": frames}
+
+
 async def compute_dispersion(sensors: list[dict]) -> dict:
     """
     Compute Gaussian plume superposition for all sensors.
