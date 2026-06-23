@@ -34,7 +34,7 @@ class TestComputeDispersionForecast:
 
     def test_returns_seven_frames(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))
@@ -42,7 +42,7 @@ class TestComputeDispersionForecast:
 
     def test_hour_offsets_0_to_6(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))
@@ -50,7 +50,7 @@ class TestComputeDispersionForecast:
 
     def test_frame_zero_label_starts_with_sekarang(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))
@@ -58,7 +58,7 @@ class TestComputeDispersionForecast:
 
     def test_later_frames_label_starts_with_h_plus(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))
@@ -67,7 +67,7 @@ class TestComputeDispersionForecast:
 
     def test_each_frame_has_required_keys(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))
@@ -79,7 +79,7 @@ class TestComputeDispersionForecast:
 
     def test_failed_fetch_uses_neutral_defaults_still_returns_seven_frames(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(side_effect=Exception("network error"))
             result = run(compute_dispersion_forecast(sensors))
@@ -87,7 +87,7 @@ class TestComputeDispersionForecast:
 
     def test_grid_values_normalised_0_to_1(self):
         sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 100.0, "tsp": 200.0}]
-        with patch("httpx.AsyncClient") as MockClient:
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
             inst = MockClient.return_value.__aenter__.return_value
             inst.get = AsyncMock(return_value=_mock_forecast_response())
             result = run(compute_dispersion_forecast(sensors))

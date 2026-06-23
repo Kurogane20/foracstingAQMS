@@ -163,7 +163,7 @@ async def _fetch_wind_forecast(
         local_hour = int(t[11:13]) if len(t) >= 13 else 12
         label_time = t[11:16]      if len(t) >= 16 else "00:00"
         result.append({
-            "speed":      max(float(speeds[i] or 1.0), 0.5),
+            "speed":      max(float(speeds[i]) if speeds[i] is not None else 0.5, 0.5),
             "direction":  float(dirs[i]   or 0.0),
             "cloudcover": float(clouds[i] or 50.0),
             "hour":       local_hour,
