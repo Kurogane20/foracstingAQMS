@@ -256,7 +256,7 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
         ]
 
         label_time = hourly_per_sensor[0][h]["label_time"] if hourly_per_sensor else "00:00"
-        label = f"Sekarang  {label_time}" if h == 0 else f"H+{h}  {label_time}"
+        label = f"Sekarang {label_time}" if h == 0 else f"H+{h} {label_time}"
 
         frames.append({
             "hour_offset":  h,
