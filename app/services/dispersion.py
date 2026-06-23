@@ -172,7 +172,7 @@ async def _fetch_wind_forecast(
     return result
 
 
-_NEUTRAL_HOUR = {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "hour": 12, "label_time": "00:00"}
+_NEUTRAL_HOUR = {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "hour": 12, "label_time": None}
 
 
 async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> dict:
@@ -204,7 +204,7 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             return_exceptions=True,
         )
 
-    neutral_all = [_NEUTRAL_HOUR] * (hours + 1)
+    neutral_all = [dict(_NEUTRAL_HOUR) for _ in range(hours + 1)]
     hourly_per_sensor = [
         fw if isinstance(fw, list) and fw else neutral_all
         for fw in fetch_results
@@ -255,7 +255,8 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             for r, c in zip(rows, cols)
         ]
 
-        label_time = hourly_per_sensor[0][h]["label_time"] if hourly_per_sensor else "00:00"
+        raw_time = hourly_per_sensor[0][h].get("label_time")
+        label_time = raw_time if raw_time is not None else datetime.now(timezone.utc).strftime("%H:%M")
         label = f"Sekarang {label_time}" if h == 0 else f"H+{h} {label_time}"
 
         frames.append({
