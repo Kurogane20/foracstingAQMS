@@ -234,7 +234,13 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             dlat = lat_grid - s["lat"]
             dlng = lng_grid - s["lng"]
             x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-            total += _plume_conc(x_down, y_cross, Q, u, stab)
+            field = _plume_conc(x_down, y_cross, Q, u, stab)
+            # Calibrate to physical scale: near-source peak ≈ sensor TSP (µg/m³),
+            # so the summed field approximates ground-level TSP concentration.
+            fpeak = field.max()
+            if fpeak > 0:
+                field *= Q / fpeak
+            total += field
 
             wind_vectors.append({
                 "uid":       s["uid"],
@@ -264,6 +270,9 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             "label":        label,
             "grid":         grid,
             "wind_vectors": wind_vectors,
+            # Peak physical concentration (µg/m³, TSP-calibrated) — multiply the
+            # normalized grid intensity by this to recover absolute values.
+            "max_conc":     round(float(peak), 1),
         })
 
     return {"frames": frames}
@@ -333,7 +342,12 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
         dlat = lat_grid - s["lat"]
         dlng = lng_grid - s["lng"]
         x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-        total += _plume_conc(x_down, y_cross, Q, u, stab)
+        field = _plume_conc(x_down, y_cross, Q, u, stab)
+        # Calibrate to physical scale (see compute_dispersion_forecast)
+        fpeak = field.max()
+        if fpeak > 0:
+            field *= Q / fpeak
+        total += field
 
     # Normalise 0–1
     peak = total.max()
@@ -355,5 +369,6 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
     return {
         "grid":         grid,
         "wind_vectors": wind_vectors,
+        "max_conc":     round(float(peak), 1),
         "updated_at":   datetime.now(timezone.utc).isoformat(),
     }
