@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import mysql.connector
 from app.config import SENSOR_DB_CONFIG, RESULT_DB_CONFIG, FEATURE_COLS
 
@@ -267,6 +267,106 @@ def get_prediction_history(uid: str, days: int = 7) -> list[dict]:
                     row[k] = v.isoformat()
             rows.append(row)
         return rows
+    finally:
+        conn.close()
+
+
+def _ensure_dispersion_validation_table(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dispersion_validation (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            target_uid VARCHAR(32) NOT NULL,
+            forecast_at DATETIME NOT NULL,
+            target_time DATETIME NOT NULL,
+            step TINYINT NOT NULL,
+            pred_conc FLOAT NOT NULL,
+            actual_tsp FLOAT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_dv (target_uid, forecast_at, step),
+            KEY idx_dv_pending (actual_tsp, target_time)
+        )
+        """
+    )
+
+
+def save_dispersion_validation(rows: list[dict]) -> None:
+    """
+    Log cross-sensor dispersal predictions for later validation.
+    Each row: {target_uid, forecast_at, target_time, step, pred_conc}.
+    Duplicate (target_uid, forecast_at, step) rows are ignored.
+    """
+    if not rows:
+        return
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        _ensure_dispersion_validation_table(cursor)
+        for r in rows:
+            cursor.execute(
+                """
+                INSERT IGNORE INTO dispersion_validation
+                    (target_uid, forecast_at, target_time, step, pred_conc)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (r["target_uid"], r["forecast_at"], r["target_time"],
+                 r["step"], r["pred_conc"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def resolve_dispersion_actuals(limit: int = 200) -> int:
+    """
+    Fill actual_tsp for validation rows whose target_time has passed, using the
+    sensor DB's mean TSP within ±30 min of target_time (UTC). Returns the
+    number of rows resolved.
+    """
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                SELECT id, target_uid, target_time FROM dispersion_validation
+                WHERE actual_tsp IS NULL AND target_time <= UTC_TIMESTAMP()
+                ORDER BY target_time ASC LIMIT %s
+                """,
+                (limit,),
+            )
+            pending = cursor.fetchall()
+        except mysql.connector.Error:
+            return 0  # table not created yet
+        if not pending:
+            return 0
+
+        sconn = mysql.connector.connect(**SENSOR_DB_CONFIG)
+        try:
+            scur = sconn.cursor()
+            ucur = conn.cursor()
+            resolved = 0
+            for row in pending:
+                ts = int(row["target_time"].replace(tzinfo=timezone.utc).timestamp())
+                scur.execute(
+                    """
+                    SELECT AVG(tsp) FROM t_loggers
+                    WHERE uid = %s AND tsp > 0 AND deleted_at IS NULL
+                      AND datetime_unix BETWEEN %s AND %s
+                    """,
+                    (row["target_uid"], ts - 1800, ts + 1800),
+                )
+                val = scur.fetchone()[0]
+                if val is not None:
+                    ucur.execute(
+                        "UPDATE dispersion_validation SET actual_tsp = %s WHERE id = %s",
+                        (float(val), row["id"]),
+                    )
+                    resolved += 1
+            conn.commit()
+            return resolved
+        finally:
+            sconn.close()
     finally:
         conn.close()
 

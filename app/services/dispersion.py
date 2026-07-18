@@ -1,9 +1,14 @@
 import asyncio
+import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import numpy as np
+
+from app.db import save_dispersion_validation, resolve_dispersion_actuals
+
+logger = logging.getLogger(__name__)
 
 M_PER_LAT = 111_000.0  # meters per degree latitude
 
@@ -64,7 +69,7 @@ async def _fetch_wind(lat: float, lng: float, client: httpx.AsyncClient) -> dict
         params={
             "latitude": lat,
             "longitude": lng,
-            "current": "wind_speed_10m,wind_direction_10m,cloudcover",
+            "current": "wind_speed_10m,wind_direction_10m,cloudcover,precipitation",
             "wind_speed_unit": "ms",
             "timezone": "auto",
         },
@@ -79,6 +84,7 @@ async def _fetch_wind(lat: float, lng: float, client: httpx.AsyncClient) -> dict
         "speed":      max(float(current.get("wind_speed_10m", 1.0)), 0.5),
         "direction":  float(current.get("wind_direction_10m", 0.0)),
         "cloudcover": float(current.get("cloudcover", 50.0)),
+        "precip":     float(current.get("precipitation", 0.0) or 0.0),
         "hour":       local_hour,
     }
 
@@ -143,7 +149,7 @@ async def _fetch_wind_forecast(
         params={
             "latitude":        lat,
             "longitude":       lng,
-            "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
+            "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover,precipitation",
             "wind_speed_unit": "ms",
             "timezone":        "auto",
             "forecast_days":   1,
@@ -156,6 +162,7 @@ async def _fetch_wind_forecast(
     speeds = hourly.get("wind_speed_10m", [])
     dirs   = hourly.get("wind_direction_10m", [])
     clouds = hourly.get("cloudcover", [])
+    precip = hourly.get("precipitation", [])
 
     result = []
     for i in range(min(hours + 1, len(times))):
@@ -166,13 +173,40 @@ async def _fetch_wind_forecast(
             "speed":      max(float(speeds[i]) if speeds[i] is not None else 0.5, 0.5),
             "direction":  float(dirs[i]   or 0.0),
             "cloudcover": float(clouds[i] or 50.0),
+            "precip":     float(precip[i] or 0.0) if i < len(precip) else 0.0,
             "hour":       local_hour,
             "label_time": label_time,
         })
     return result
 
 
-_NEUTRAL_HOUR = {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "hour": 12, "label_time": None}
+_NEUTRAL_HOUR = {"speed": 2.0, "direction": 0.0, "cloudcover": 50.0, "precip": 0.0, "hour": 12, "label_time": None}
+
+
+def _washout_factor(precip_mm: float) -> float:
+    """
+    Rain scavenging: wet deposition removes suspended dust roughly
+    exponentially with rainfall intensity. 0 mm→1.0, 1 mm→0.61, 3 mm→0.22.
+    """
+    return math.exp(-0.5 * max(precip_mm, 0.0))
+
+
+def _plume_conc_point(
+    dlat: float, dlng: float, wind_dir: float, lat_ref: float,
+    Q: float, u: float, stab: str,
+) -> float:
+    """Evaluate the (uncalibrated) plume at a single lat/lng offset."""
+    x, y = _rotate_to_plume(np.array([dlat]), np.array([dlng]), wind_dir, lat_ref)
+    return float(_plume_conc(x, y, Q, u, stab)[0])
+
+
+def _log_validation(rows: list[dict]) -> None:
+    """Persist cross-sensor validation rows + resolve past actuals (thread)."""
+    try:
+        save_dispersion_validation(rows)
+        resolve_dispersion_actuals()
+    except Exception as exc:  # never break the endpoint over logging
+        logger.warning("dispersion validation logging failed: %s", exc)
 
 
 async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> dict:
@@ -221,9 +255,13 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
     lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
 
     frames = []
+    validation_rows: list[dict] = []
+    forecast_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
     for h in range(hours + 1):
         total = np.zeros(lat_grid.shape, dtype=np.float64)
         wind_vectors = []
+        hour_params = []   # per-sensor params for cross-sensor validation
 
         for s, hw in zip(sensors, hourly_per_sensor):
             w    = hw[h] if h < len(hw) else hw[-1]
@@ -238,10 +276,16 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             # Calibrate to physical scale: near-source peak ≈ sensor TSP (µg/m³),
             # so the summed field approximates ground-level TSP concentration.
             fpeak = field.max()
-            if fpeak > 0:
-                field *= Q / fpeak
-            total += field
+            scale = (Q / fpeak) if fpeak > 0 else 0.0
+            # Wet deposition: rain washes dust out of the air
+            scale *= _washout_factor(w.get("precip", 0.0))
+            total += field * scale
 
+            hour_params.append({
+                "uid": s["uid"], "lat": s["lat"], "lng": s["lng"],
+                "Q": Q, "u": u, "stab": stab,
+                "dir": w["direction"], "scale": scale,
+            })
             wind_vectors.append({
                 "uid":       s["uid"],
                 "lat":       s["lat"],
@@ -249,6 +293,29 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                 "speed":     w["speed"],
                 "direction": w["direction"],
             })
+
+        # Cross-sensor validation: predicted concentration AT each sensor's
+        # location contributed by OTHER sensors' plumes (own plume excluded —
+        # it trivially dominates at its own source). Compared later with the
+        # sensor's actual TSP reading.
+        if 1 <= h <= 3:
+            target_time = forecast_at + timedelta(hours=h)
+            for tgt in hour_params:
+                conc = 0.0
+                for src in hour_params:
+                    if src["uid"] == tgt["uid"] or src["scale"] <= 0:
+                        continue
+                    conc += src["scale"] * _plume_conc_point(
+                        tgt["lat"] - src["lat"], tgt["lng"] - src["lng"],
+                        src["dir"], src["lat"], src["Q"], src["u"], src["stab"],
+                    )
+                validation_rows.append({
+                    "target_uid":  tgt["uid"],
+                    "forecast_at": forecast_at.replace(tzinfo=None),
+                    "target_time": target_time.replace(tzinfo=None),
+                    "step":        h,
+                    "pred_conc":   round(conc, 2),
+                })
 
         peak = total.max()
         if peak > 0:
@@ -274,6 +341,10 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             # normalized grid intensity by this to recover absolute values.
             "max_conc":     round(float(peak), 1),
         })
+
+    # Fire-and-forget: log validation rows + resolve past actuals off-thread
+    if validation_rows:
+        asyncio.get_running_loop().run_in_executor(None, _log_validation, validation_rows)
 
     return {"frames": frames}
 
@@ -345,9 +416,9 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
         field = _plume_conc(x_down, y_cross, Q, u, stab)
         # Calibrate to physical scale (see compute_dispersion_forecast)
         fpeak = field.max()
-        if fpeak > 0:
-            field *= Q / fpeak
-        total += field
+        scale = (Q / fpeak) if fpeak > 0 else 0.0
+        scale *= _washout_factor(w.get("precip", 0.0))
+        total += field * scale
 
     # Normalise 0–1
     peak = total.max()
