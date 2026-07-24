@@ -497,6 +497,12 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
     lng_vals = np.arange(min(lngs) - EXTENT, max(lngs) + EXTENT + STEP, STEP)
     lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
 
+    # Prefer tomography-recovered emission sources (same as the forecast path)
+    try:
+        emission_sources = await asyncio.to_thread(get_emission_sources)
+    except Exception:
+        emission_sources = []
+
     now_hour = int(datetime.now(timezone.utc).timestamp() // 3600 * 3600)
     total_sum = np.zeros(lat_grid.shape, dtype=np.float64)
     n_hours = 0
@@ -504,25 +510,64 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
     for h_back in range(24):
         hour_unix = now_hour - (23 - h_back) * 3600
         hour_field = np.zeros(lat_grid.shape, dtype=np.float64)
-        for si, s in enumerate(sensors):
-            winds = wind_per_sensor[si]
-            w = winds[h_back] if h_back < len(winds) else winds[-1]
-            # Emission proxy: that hour's actual mean TSP; fall back to current
-            Q = tsp_per_sensor[si].get(hour_unix)
-            if Q is None:
-                Q = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
-            Q = max(float(Q), 1.0)
-            u    = w["speed"]
-            stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
 
-            dlat = lat_grid - s["lat"]
-            dlng = lng_grid - s["lng"]
-            x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-            field = _plume_conc(x_down, y_cross, Q, u, stab)
-            fpeak = field.max()
-            scale = (Q / fpeak) if fpeak > 0 else 0.0
-            scale *= _washout_factor(w.get("precip", 0.0))
-            hour_field += field * scale
+        if emission_sources:
+            # ── Source-based hourly field, calibrated to that hour's obs ──
+            pt_conc = np.zeros(len(sensors))
+            for src in emission_sources:
+                dists = [
+                    (float(src["lat"]) - s["lat"]) ** 2 + (float(src["lng"]) - s["lng"]) ** 2
+                    for s in sensors
+                ]
+                si_near = int(np.argmin(dists))
+                winds = wind_per_sensor[si_near]
+                w = winds[h_back] if h_back < len(winds) else winds[-1]
+                u    = w["speed"]
+                stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+                wash = _washout_factor(w.get("precip", 0.0))
+                Qrel = max(float(src["strength"]), 0.01)
+
+                dlat = lat_grid - float(src["lat"])
+                dlng = lng_grid - float(src["lng"])
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], float(src["lat"]))
+                hour_field += _plume_conc(x_down, y_cross, Qrel, u, stab) * wash
+
+                for si, s in enumerate(sensors):
+                    pt_conc[si] += wash * _plume_conc_point(
+                        s["lat"] - float(src["lat"]), s["lng"] - float(src["lng"]),
+                        w["direction"], float(src["lat"]), Qrel, u, stab,
+                    )
+
+            # Calibrate against this hour's ACTUAL sensor TSP where available
+            obs = np.array([
+                float(tsp_per_sensor[si].get(hour_unix)
+                      or max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0))
+                for si, s in enumerate(sensors)
+            ])
+            denom = float(np.sum(pt_conc ** 2))
+            cal = float(np.sum(pt_conc * obs) / denom) if denom > 1e-12 else 0.0
+            hour_field *= cal
+        else:
+            # ── Legacy sensor-as-source hourly field ─────────────
+            for si, s in enumerate(sensors):
+                winds = wind_per_sensor[si]
+                w = winds[h_back] if h_back < len(winds) else winds[-1]
+                Q = tsp_per_sensor[si].get(hour_unix)
+                if Q is None:
+                    Q = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
+                Q = max(float(Q), 1.0)
+                u    = w["speed"]
+                stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+
+                dlat = lat_grid - s["lat"]
+                dlng = lng_grid - s["lng"]
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
+                field = _plume_conc(x_down, y_cross, Q, u, stab)
+                fpeak = field.max()
+                scale = (Q / fpeak) if fpeak > 0 else 0.0
+                scale *= _washout_factor(w.get("precip", 0.0))
+                hour_field += field * scale
+
         total_sum += hour_field
         n_hours += 1
 
