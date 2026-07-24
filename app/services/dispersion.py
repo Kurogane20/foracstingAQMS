@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import numpy as np
 
-from app.db import save_dispersion_validation, resolve_dispersion_actuals, get_hourly_tsp
+from app.db import (
+    save_dispersion_validation,
+    resolve_dispersion_actuals,
+    get_hourly_tsp,
+    get_emission_sources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +259,14 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
     lng_vals = np.arange(min(lngs) - EXTENT, max(lngs) + EXTENT + STEP, STEP)
     lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
 
+    # Emission sources from tomography inversion (preferred). When present,
+    # plumes are emitted from the RECOVERED SOURCE CELLS (pit/hauling areas)
+    # instead of the sensor positions — sensors act purely as receptors.
+    try:
+        emission_sources = await asyncio.to_thread(get_emission_sources)
+    except Exception:
+        emission_sources = []
+
     frames = []
     validation_rows: list[dict] = []
     forecast_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
@@ -263,29 +276,10 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
         wind_vectors = []
         hour_params = []   # per-sensor params for cross-sensor validation
 
+        met_this_hour = []
         for s, hw in zip(sensors, hourly_per_sensor):
-            w    = hw[h] if h < len(hw) else hw[-1]
-            Q    = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
-            u    = w["speed"]
-            stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
-
-            dlat = lat_grid - s["lat"]
-            dlng = lng_grid - s["lng"]
-            x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-            field = _plume_conc(x_down, y_cross, Q, u, stab)
-            # Calibrate to physical scale: near-source peak ≈ sensor TSP (µg/m³),
-            # so the summed field approximates ground-level TSP concentration.
-            fpeak = field.max()
-            scale = (Q / fpeak) if fpeak > 0 else 0.0
-            # Wet deposition: rain washes dust out of the air
-            scale *= _washout_factor(w.get("precip", 0.0))
-            total += field * scale
-
-            hour_params.append({
-                "uid": s["uid"], "lat": s["lat"], "lng": s["lng"],
-                "Q": Q, "u": u, "stab": stab,
-                "dir": w["direction"], "scale": scale,
-            })
+            w = hw[h] if h < len(hw) else hw[-1]
+            met_this_hour.append(w)
             wind_vectors.append({
                 "uid":       s["uid"],
                 "lat":       s["lat"],
@@ -294,28 +288,91 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                 "direction": w["direction"],
             })
 
-        # Cross-sensor validation: predicted concentration AT each sensor's
-        # location contributed by OTHER sensors' plumes (own plume excluded —
-        # it trivially dominates at its own source). Compared later with the
-        # sensor's actual TSP reading.
-        if 1 <= h <= 3:
-            target_time = forecast_at + timedelta(hours=h)
-            for tgt in hour_params:
-                conc = 0.0
-                for src in hour_params:
-                    if src["uid"] == tgt["uid"] or src["scale"] <= 0:
-                        continue
-                    conc += src["scale"] * _plume_conc_point(
-                        tgt["lat"] - src["lat"], tgt["lng"] - src["lng"],
-                        src["dir"], src["lat"], src["Q"], src["u"], src["stab"],
+        if emission_sources:
+            # ── Source-based field (tomography mode) ─────────────
+            pt_conc = np.zeros(len(sensors))   # raw field value at each sensor
+            for src in emission_sources:
+                # Met at the source ≈ met of the nearest sensor
+                dists = [
+                    (float(src["lat"]) - s["lat"]) ** 2 + (float(src["lng"]) - s["lng"]) ** 2
+                    for s in sensors
+                ]
+                w = met_this_hour[int(np.argmin(dists))]
+                u    = w["speed"]
+                stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+                wash = _washout_factor(w.get("precip", 0.0))
+                Qrel = max(float(src["strength"]), 0.01)
+
+                dlat = lat_grid - float(src["lat"])
+                dlng = lng_grid - float(src["lng"])
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], float(src["lat"]))
+                total += _plume_conc(x_down, y_cross, Qrel, u, stab) * wash
+
+                for si, s in enumerate(sensors):
+                    pt_conc[si] += wash * _plume_conc_point(
+                        s["lat"] - float(src["lat"]), s["lng"] - float(src["lng"]),
+                        w["direction"], float(src["lat"]), Qrel, u, stab,
                     )
-                validation_rows.append({
-                    "target_uid":  tgt["uid"],
-                    "forecast_at": forecast_at.replace(tzinfo=None),
-                    "target_time": target_time.replace(tzinfo=None),
-                    "step":        h,
-                    "pred_conc":   round(conc, 2),
+
+            # Calibrate the whole field so values at the sensor locations best
+            # match the sensors' (predicted) TSP — least-squares scalar fit.
+            obs = np.array([max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0) for s in sensors])
+            denom = float(np.sum(pt_conc ** 2))
+            cal = float(np.sum(pt_conc * obs) / denom) if denom > 1e-12 else 0.0
+            total *= cal
+
+            if 1 <= h <= 3 and cal > 0:
+                target_time = forecast_at + timedelta(hours=h)
+                for si, s in enumerate(sensors):
+                    validation_rows.append({
+                        "target_uid":  s["uid"],
+                        "forecast_at": forecast_at.replace(tzinfo=None),
+                        "target_time": target_time.replace(tzinfo=None),
+                        "step":        h,
+                        "pred_conc":   round(float(pt_conc[si]) * cal, 2),
+                    })
+        else:
+            # ── Legacy sensor-as-source field ────────────────────
+            for s, w in zip(sensors, met_this_hour):
+                Q    = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
+                u    = w["speed"]
+                stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+
+                dlat = lat_grid - s["lat"]
+                dlng = lng_grid - s["lng"]
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
+                field = _plume_conc(x_down, y_cross, Q, u, stab)
+                # Calibrate to physical scale: near-source peak ≈ sensor TSP
+                fpeak = field.max()
+                scale = (Q / fpeak) if fpeak > 0 else 0.0
+                scale *= _washout_factor(w.get("precip", 0.0))
+                total += field * scale
+
+                hour_params.append({
+                    "uid": s["uid"], "lat": s["lat"], "lng": s["lng"],
+                    "Q": Q, "u": u, "stab": stab,
+                    "dir": w["direction"], "scale": scale,
                 })
+
+            # Cross-sensor validation (own plume excluded)
+            if 1 <= h <= 3:
+                target_time = forecast_at + timedelta(hours=h)
+                for tgt in hour_params:
+                    conc = 0.0
+                    for src in hour_params:
+                        if src["uid"] == tgt["uid"] or src["scale"] <= 0:
+                            continue
+                        conc += src["scale"] * _plume_conc_point(
+                            tgt["lat"] - src["lat"], tgt["lng"] - src["lng"],
+                            src["dir"], src["lat"], src["Q"], src["u"], src["stab"],
+                        )
+                    validation_rows.append({
+                        "target_uid":  tgt["uid"],
+                        "forecast_at": forecast_at.replace(tzinfo=None),
+                        "target_time": target_time.replace(tzinfo=None),
+                        "step":        h,
+                        "pred_conc":   round(conc, 2),
+                    })
 
         peak = total.max()
         if peak > 0:
@@ -346,7 +403,15 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
     if validation_rows:
         asyncio.get_running_loop().run_in_executor(None, _log_validation, validation_rows)
 
-    return {"frames": frames}
+    return {
+        "frames":      frames,
+        "source_mode": "inversion" if emission_sources else "sensor",
+        "sources": [
+            {"lat": float(s["lat"]), "lng": float(s["lng"]),
+             "strength": float(s["strength"]), "cell_deg": float(s["cell_deg"])}
+            for s in emission_sources
+        ],
+    }
 
 
 async def _fetch_wind_past24(lat: float, lng: float, client: httpx.AsyncClient) -> list[dict]:

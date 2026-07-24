@@ -1,11 +1,15 @@
-from fastapi import APIRouter, Depends
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from app.auth import require_api_key
+from app.db import get_emission_sources
 from app.services.dispersion import (
     compute_dispersion,
     compute_dispersion_forecast,
     compute_dispersion_daily,
 )
+from app.services.source_inversion import run_source_inversion
 
 router = APIRouter(tags=["dispersion"])
 
@@ -49,3 +53,22 @@ async def get_dispersion_daily(body: DispersionRequest):
     Returns {"grid", "wind_vectors", "max_conc", "period", "updated_at"}.
     """
     return await compute_dispersion_daily([s.model_dump() for s in body.sensors])
+
+
+@router.post("/sources/calibrate", dependencies=[Depends(require_api_key)])
+async def calibrate_emission_sources(days: int = 45):
+    """
+    Run emission-source tomography: invert months of sensor TSP + archive wind
+    into an emission-strength map, storing the strongest cells as the active
+    emission sources used by the dispersion endpoints. Heavy (1–3 minutes).
+    """
+    try:
+        return await asyncio.to_thread(run_source_inversion, days)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/sources", dependencies=[Depends(require_api_key)])
+async def list_emission_sources():
+    """Active emission sources produced by the latest inversion run."""
+    return {"sources": await asyncio.to_thread(get_emission_sources)}

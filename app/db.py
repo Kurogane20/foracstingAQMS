@@ -296,6 +296,66 @@ def get_hourly_tsp(uid: str, hours: int = 24) -> dict[int, float]:
         conn.close()
 
 
+def _ensure_emission_sources_table(cursor) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emission_sources (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            lat DOUBLE NOT NULL,
+            lng DOUBLE NOT NULL,
+            strength DOUBLE NOT NULL,
+            cell_deg DOUBLE NOT NULL,
+            method VARCHAR(32) NOT NULL DEFAULT 'inversion',
+            run_at DATETIME NOT NULL,
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def replace_emission_sources(rows: list[dict], method: str, run_at: datetime) -> None:
+    """
+    Replace the active emission-source set produced by an inversion run.
+    Each row: {lat, lng, strength, cell_deg}.
+    """
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        _ensure_emission_sources_table(cursor)
+        cursor.execute(
+            "UPDATE emission_sources SET active = 0 WHERE method = %s", (method,)
+        )
+        for r in rows:
+            cursor.execute(
+                """
+                INSERT INTO emission_sources (lat, lng, strength, cell_deg, method, run_at, active)
+                VALUES (%s, %s, %s, %s, %s, %s, 1)
+                """,
+                (r["lat"], r["lng"], r["strength"], r["cell_deg"], method, run_at),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_emission_sources() -> list[dict]:
+    """Active emission sources (empty list when none / table missing)."""
+    conn = mysql.connector.connect(**RESULT_DB_CONFIG)
+    try:
+        cursor = conn.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                "SELECT lat, lng, strength, cell_deg, method, run_at "
+                "FROM emission_sources WHERE active = 1 ORDER BY strength DESC"
+            )
+            return [dict(r) for r in cursor.fetchall()]
+        except mysql.connector.Error:
+            return []
+    finally:
+        conn.close()
+
+
 def _ensure_dispersion_validation_table(cursor) -> None:
     cursor.execute(
         """
