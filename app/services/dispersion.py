@@ -396,7 +396,11 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                         "pred_conc":   round(float(pt_conc[si]) * cal, 2),
                     })
         else:
-            # ── Legacy sensor-as-source field ────────────────────
+            # ── Sensor-as-source field ───────────────────────────
+            # Sensors are INSTALLED AT the emission points (in the mine areas),
+            # so emitting from the sensor position with the measured TSP as
+            # source strength is physically the right representation. Area
+            # sigma0 because the sensor stands in a wide pit, not at a point.
             for s, w in zip(sensors, met_this_hour):
                 Q    = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
                 u    = w["speed"]
@@ -405,7 +409,8 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                 dlat = lat_grid - s["lat"]
                 dlng = lng_grid - s["lng"]
                 x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-                field = _plume_conc(x_down, y_cross, Q, u, stab)
+                field = _plume_conc(x_down, y_cross, Q, u, stab,
+                                    AREA_SIGMA0_Y, AREA_SIGMA0_Z)
                 # Calibrate to physical scale: near-source peak ≈ sensor TSP
                 fpeak = field.max()
                 scale = (Q / fpeak) if fpeak > 0 else 0.0
@@ -429,6 +434,7 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                         conc += src["scale"] * _plume_conc_point(
                             tgt["lat"] - src["lat"], tgt["lng"] - src["lng"],
                             src["dir"], src["lat"], src["Q"], src["u"], src["stab"],
+                            AREA_SIGMA0_Y, AREA_SIGMA0_Z,
                         )
                     validation_rows.append({
                         "target_uid":  tgt["uid"],
@@ -621,7 +627,7 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
                 cal = min(cal, peak_cap / peak_raw) if cal > 0 else (0.5 * peak_cap) / peak_raw
             hour_field *= cal
         else:
-            # ── Legacy sensor-as-source hourly field ─────────────
+            # ── Sensor-as-source hourly field (sensors AT emission points) ──
             for si, s in enumerate(sensors):
                 winds = wind_per_sensor[si]
                 w = winds[h_back] if h_back < len(winds) else winds[-1]
@@ -635,7 +641,8 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
                 dlat = lat_grid - s["lat"]
                 dlng = lng_grid - s["lng"]
                 x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-                field = _plume_conc(x_down, y_cross, Q, u, stab)
+                field = _plume_conc(x_down, y_cross, Q, u, stab,
+                                    AREA_SIGMA0_Y, AREA_SIGMA0_Z)
                 fpeak = field.max()
                 scale = (Q / fpeak) if fpeak > 0 else 0.0
                 scale *= _washout_factor(w.get("precip", 0.0))
@@ -745,7 +752,8 @@ async def compute_dispersion(sensors: list[dict]) -> dict:
         dlat = lat_grid - s["lat"]
         dlng = lng_grid - s["lng"]
         x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
-        field = _plume_conc(x_down, y_cross, Q, u, stab)
+        field = _plume_conc(x_down, y_cross, Q, u, stab,
+                            AREA_SIGMA0_Y, AREA_SIGMA0_Z)
         # Calibrate to physical scale (see compute_dispersion_forecast)
         fpeak = field.max()
         scale = (Q / fpeak) if fpeak > 0 else 0.0
