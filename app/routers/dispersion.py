@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from app.auth import require_api_key
-from app.services.dispersion import compute_dispersion, compute_dispersion_forecast
+from app.services.dispersion import (
+    compute_dispersion,
+    compute_dispersion_forecast,
+    compute_dispersion_daily,
+)
 
 router = APIRouter(tags=["dispersion"])
 
@@ -35,3 +39,13 @@ async def get_dispersion_forecast(body: DispersionRequest):
     Returns {"frames": [{hour_offset, label, grid, wind_vectors}, ...]} with 7 frames.
     """
     return await compute_dispersion_forecast([s.model_dump() for s in body.sensors])
+
+
+@router.post("/dispersion/daily", dependencies=[Depends(require_api_key)])
+async def get_dispersion_daily(body: DispersionRequest):
+    """
+    24-hour average dispersion map (AERMOD-style reporting product), using the
+    past-24h hourly wind and each sensor's actual hourly-mean TSP per hour.
+    Returns {"grid", "wind_vectors", "max_conc", "period", "updated_at"}.
+    """
+    return await compute_dispersion_daily([s.model_dump() for s in body.sensors])

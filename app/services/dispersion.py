@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import numpy as np
 
-from app.db import save_dispersion_validation, resolve_dispersion_actuals
+from app.db import save_dispersion_validation, resolve_dispersion_actuals, get_hourly_tsp
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +347,155 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
         asyncio.get_running_loop().run_in_executor(None, _log_validation, validation_rows)
 
     return {"frames": frames}
+
+
+async def _fetch_wind_past24(lat: float, lng: float, client: httpx.AsyncClient) -> list[dict]:
+    """Past-24-hour hourly wind/cloud/precip from Open-Meteo (past_days=1)."""
+    resp = await client.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude":        lat,
+            "longitude":       lng,
+            "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover,precipitation",
+            "wind_speed_unit": "ms",
+            "timezone":        "auto",
+            "past_days":       1,
+            "forecast_days":   1,
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    hourly = resp.json().get("hourly", {})
+    times  = hourly.get("time", [])
+    speeds = hourly.get("wind_speed_10m", [])
+    dirs   = hourly.get("wind_direction_10m", [])
+    clouds = hourly.get("cloudcover", [])
+    precip = hourly.get("precipitation", [])
+
+    # Keep only hours that have already passed (past_days includes future too)
+    now_utc_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    rows = []
+    for i, t in enumerate(times):
+        rows.append({
+            "time":       t,
+            "speed":      max(float(speeds[i]) if speeds[i] is not None else 0.5, 0.5),
+            "direction":  float(dirs[i]   or 0.0),
+            "cloudcover": float(clouds[i] or 50.0),
+            "precip":     float(precip[i] or 0.0) if i < len(precip) else 0.0,
+            "hour":       int(t[11:13]) if len(t) >= 13 else 12,
+        })
+    # Times are local; the array is chronological — the past 24 h are simply the
+    # 24 entries ending at "now" position. past_days=1 → first 24 entries are
+    # yesterday; entries beyond local-now are forecast. Use a conservative cut:
+    # drop the trailing forecast hours by keeping the first 24 + hours elapsed
+    # today, then take the last 24.
+    elapsed_today = now_utc_hour.hour + 1  # coarse; local offset differences are tolerable here
+    usable = rows[: min(len(rows), 24 + elapsed_today)]
+    return usable[-24:] if len(usable) >= 24 else usable
+
+
+async def compute_dispersion_daily(sensors: list[dict]) -> dict:
+    """
+    24-hour average Gaussian plume map (AERMOD-style reporting product).
+    Uses past-24h hourly wind AND each sensor's actual hourly-mean TSP as the
+    emission proxy for that hour.
+
+    Returns {"grid": [[lat,lng,intensity],...], "wind_vectors": [...],
+             "max_conc": float, "period": {"start","end"}, "updated_at": iso}
+    """
+    if not sensors:
+        return {"grid": [], "wind_vectors": [], "max_conc": 0.0,
+                "period": None, "updated_at": datetime.now(timezone.utc).isoformat()}
+
+    async with httpx.AsyncClient() as client:
+        wind_results = await asyncio.gather(
+            *[_fetch_wind_past24(s["lat"], s["lng"], client) for s in sensors],
+            return_exceptions=True,
+        )
+    wind_per_sensor = [
+        w if isinstance(w, list) and w else [dict(_NEUTRAL_HOUR) for _ in range(24)]
+        for w in wind_results
+    ]
+
+    # Actual hourly TSP per sensor (blocking DB reads off-thread)
+    tsp_results = await asyncio.gather(
+        *[asyncio.to_thread(get_hourly_tsp, s["uid"], 26) for s in sensors],
+        return_exceptions=True,
+    )
+    tsp_per_sensor = [t if isinstance(t, dict) else {} for t in tsp_results]
+
+    EXTENT = 0.25
+    STEP   = 0.008
+    lats = [s["lat"] for s in sensors]
+    lngs = [s["lng"] for s in sensors]
+    lat_vals = np.arange(min(lats) - EXTENT, max(lats) + EXTENT + STEP, STEP)
+    lng_vals = np.arange(min(lngs) - EXTENT, max(lngs) + EXTENT + STEP, STEP)
+    lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
+
+    now_hour = int(datetime.now(timezone.utc).timestamp() // 3600 * 3600)
+    total_sum = np.zeros(lat_grid.shape, dtype=np.float64)
+    n_hours = 0
+
+    for h_back in range(24):
+        hour_unix = now_hour - (23 - h_back) * 3600
+        hour_field = np.zeros(lat_grid.shape, dtype=np.float64)
+        for si, s in enumerate(sensors):
+            winds = wind_per_sensor[si]
+            w = winds[h_back] if h_back < len(winds) else winds[-1]
+            # Emission proxy: that hour's actual mean TSP; fall back to current
+            Q = tsp_per_sensor[si].get(hour_unix)
+            if Q is None:
+                Q = max(float(s.get("tsp", 0) or s.get("pm25", 50.0)), 1.0)
+            Q = max(float(Q), 1.0)
+            u    = w["speed"]
+            stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+
+            dlat = lat_grid - s["lat"]
+            dlng = lng_grid - s["lng"]
+            x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
+            field = _plume_conc(x_down, y_cross, Q, u, stab)
+            fpeak = field.max()
+            scale = (Q / fpeak) if fpeak > 0 else 0.0
+            scale *= _washout_factor(w.get("precip", 0.0))
+            hour_field += field * scale
+        total_sum += hour_field
+        n_hours += 1
+
+    total = total_sum / max(n_hours, 1)
+    peak = float(total.max())
+    if peak > 0:
+        total /= peak
+
+    THRESHOLD = 0.02
+    rows_i, cols_i = np.where(total >= THRESHOLD)
+    grid = [
+        [round(float(lat_grid[r, c]), 5), round(float(lng_grid[r, c]), 5), round(float(total[r, c]), 3)]
+        for r, c in zip(rows_i, cols_i)
+    ]
+
+    # Mean wind per sensor (vector average) for display arrows
+    wind_vectors = []
+    for si, s in enumerate(sensors):
+        winds = wind_per_sensor[si]
+        us = np.array([w["speed"] for w in winds])
+        ds = np.deg2rad(np.array([w["direction"] for w in winds]))
+        mean_e = float(np.mean(us * np.sin(ds)))
+        mean_n = float(np.mean(us * np.cos(ds)))
+        wind_vectors.append({
+            "uid": s["uid"], "lat": s["lat"], "lng": s["lng"],
+            "speed": round(float(np.hypot(mean_e, mean_n)), 2),
+            "direction": round(float((math.degrees(math.atan2(mean_e, mean_n)) + 360) % 360), 1),
+        })
+
+    start_dt = datetime.fromtimestamp(now_hour - 23 * 3600, tz=timezone.utc)
+    end_dt   = datetime.fromtimestamp(now_hour + 3600, tz=timezone.utc)
+    return {
+        "grid":         grid,
+        "wind_vectors": wind_vectors,
+        "max_conc":     round(peak, 1),
+        "period":       {"start": start_dt.isoformat(), "end": end_dt.isoformat()},
+        "updated_at":   datetime.now(timezone.utc).isoformat(),
+    }
 
 
 async def compute_dispersion(sensors: list[dict]) -> dict:

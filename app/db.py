@@ -271,6 +271,31 @@ def get_prediction_history(uid: str, days: int = 7) -> list[dict]:
         conn.close()
 
 
+def get_hourly_tsp(uid: str, hours: int = 24) -> dict[int, float]:
+    """
+    Hourly-mean TSP for the past `hours` hours from the sensor DB.
+    Returns {unix_hour_start: mean_tsp}.
+    """
+    import time as _time
+    since = int(_time.time()) - hours * 3600
+    conn = mysql.connector.connect(**SENSOR_DB_CONFIG)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT FLOOR(datetime_unix / 3600) * 3600 AS hour_start, AVG(tsp)
+            FROM t_loggers
+            WHERE uid = %s AND tsp > 0 AND deleted_at IS NULL
+              AND datetime_unix >= %s
+            GROUP BY hour_start
+            """,
+            (uid, since),
+        )
+        return {int(h): float(v) for h, v in cursor.fetchall() if v is not None}
+    finally:
+        conn.close()
+
+
 def _ensure_dispersion_validation_table(cursor) -> None:
     cursor.execute(
         """
