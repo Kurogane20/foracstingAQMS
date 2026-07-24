@@ -205,6 +205,70 @@ def _plume_conc_point(
     return float(_plume_conc(x, y, Q, u, stab)[0])
 
 
+def _prepare_emitters(sources: list[dict]) -> list[dict]:
+    """
+    Cluster adjacent inversion cells into AREA sources, each emitted from 5
+    sub-points so the near-field core is broad (like a pit complex) instead of
+    12 needle plumes from isolated cells.
+    Returns [{lat, lng, Q}] emitter points.
+    """
+    pts = [
+        {"lat": float(s["lat"]), "lng": float(s["lng"]), "q": max(float(s["strength"]), 0.01)}
+        for s in sources
+    ]
+    order = sorted(range(len(pts)), key=lambda i: -pts[i]["q"])
+    used: set[int] = set()
+    emitters: list[dict] = []
+
+    for i in order:
+        if i in used:
+            continue
+        group = [i]
+        used.add(i)
+        for j in order:
+            if j in used:
+                continue
+            if abs(pts[j]["lat"] - pts[i]["lat"]) <= 0.045 and \
+               abs(pts[j]["lng"] - pts[i]["lng"]) <= 0.045:
+                group.append(j)
+                used.add(j)
+
+        w = sum(pts[k]["q"] for k in group)
+        clat = sum(pts[k]["q"] * pts[k]["lat"] for k in group) / w
+        clng = sum(pts[k]["q"] * pts[k]["lng"] for k in group) / w
+        r = max(
+            max((abs(pts[k]["lat"] - clat) for k in group), default=0.0),
+            max((abs(pts[k]["lng"] - clng) for k in group), default=0.0),
+            0.012,
+        ) * 0.7
+
+        for dlat, dlng in [(0, 0), (r, 0), (-r, 0), (0, r), (0, -r)]:
+            emitters.append({"lat": clat + dlat, "lng": clng + dlng, "Q": w / 5.0})
+    return emitters
+
+
+def _background_field(
+    lat_grid: np.ndarray,
+    lng_grid: np.ndarray,
+    sensors: list[dict],
+    residuals: np.ndarray,
+) -> np.ndarray:
+    """
+    Smooth ambient-background surface (µg/m³) from per-sensor residuals
+    (observed TSP minus modeled plume), inverse-distance interpolated. This is
+    what colors the WHOLE domain like an AERMOD report, instead of leaving
+    bare map outside the plumes.
+    """
+    bg = np.zeros(lat_grid.shape, dtype=np.float64)
+    wsum = np.zeros(lat_grid.shape, dtype=np.float64)
+    for s, r in zip(sensors, residuals):
+        d2 = (lat_grid - s["lat"]) ** 2 + (lng_grid - s["lng"]) ** 2 + 1e-6
+        w = 1.0 / d2
+        bg += w * max(float(r), 0.0)
+        wsum += w
+    return bg / np.maximum(wsum, 1e-12)
+
+
 def _log_validation(rows: list[dict]) -> None:
     """Persist cross-sensor validation rows + resolve past actuals (thread)."""
     try:
@@ -290,28 +354,29 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
 
         if emission_sources:
             # ── Source-based field (tomography mode) ─────────────
+            emitters = _prepare_emitters(emission_sources)
             pt_conc = np.zeros(len(sensors))   # raw field value at each sensor
-            for src in emission_sources:
+            for src in emitters:
                 # Met at the source ≈ met of the nearest sensor
                 dists = [
-                    (float(src["lat"]) - s["lat"]) ** 2 + (float(src["lng"]) - s["lng"]) ** 2
+                    (src["lat"] - s["lat"]) ** 2 + (src["lng"] - s["lng"]) ** 2
                     for s in sensors
                 ]
                 w = met_this_hour[int(np.argmin(dists))]
                 u    = w["speed"]
                 stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
                 wash = _washout_factor(w.get("precip", 0.0))
-                Qrel = max(float(src["strength"]), 0.01)
+                Qrel = src["Q"]
 
-                dlat = lat_grid - float(src["lat"])
-                dlng = lng_grid - float(src["lng"])
-                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], float(src["lat"]))
+                dlat = lat_grid - src["lat"]
+                dlng = lng_grid - src["lng"]
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], src["lat"])
                 total += _plume_conc(x_down, y_cross, Qrel, u, stab) * wash
 
                 for si, s in enumerate(sensors):
                     pt_conc[si] += wash * _plume_conc_point(
-                        s["lat"] - float(src["lat"]), s["lng"] - float(src["lng"]),
-                        w["direction"], float(src["lat"]), Qrel, u, stab,
+                        s["lat"] - src["lat"], s["lng"] - src["lng"],
+                        w["direction"], src["lat"], Qrel, u, stab,
                     )
 
             # Calibrate the whole field so values at the sensor locations best
@@ -320,6 +385,11 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             denom = float(np.sum(pt_conc ** 2))
             cal = float(np.sum(pt_conc * obs) / denom) if denom > 1e-12 else 0.0
             total *= cal
+
+            # Ambient background: sensors' unexplained TSP interpolated across
+            # the domain — colors the whole map like an AERMOD report.
+            residuals = obs - cal * pt_conc
+            total += _background_field(lat_grid, lng_grid, sensors, residuals)
 
             if 1 <= h <= 3 and cal > 0:
                 target_time = forecast_at + timedelta(hours=h)
@@ -513,10 +583,11 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
 
         if emission_sources:
             # ── Source-based hourly field, calibrated to that hour's obs ──
+            emitters = _prepare_emitters(emission_sources)
             pt_conc = np.zeros(len(sensors))
-            for src in emission_sources:
+            for src in emitters:
                 dists = [
-                    (float(src["lat"]) - s["lat"]) ** 2 + (float(src["lng"]) - s["lng"]) ** 2
+                    (src["lat"] - s["lat"]) ** 2 + (src["lng"] - s["lng"]) ** 2
                     for s in sensors
                 ]
                 si_near = int(np.argmin(dists))
@@ -525,17 +596,17 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
                 u    = w["speed"]
                 stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
                 wash = _washout_factor(w.get("precip", 0.0))
-                Qrel = max(float(src["strength"]), 0.01)
+                Qrel = src["Q"]
 
-                dlat = lat_grid - float(src["lat"])
-                dlng = lng_grid - float(src["lng"])
-                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], float(src["lat"]))
+                dlat = lat_grid - src["lat"]
+                dlng = lng_grid - src["lng"]
+                x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], src["lat"])
                 hour_field += _plume_conc(x_down, y_cross, Qrel, u, stab) * wash
 
                 for si, s in enumerate(sensors):
                     pt_conc[si] += wash * _plume_conc_point(
-                        s["lat"] - float(src["lat"]), s["lng"] - float(src["lng"]),
-                        w["direction"], float(src["lat"]), Qrel, u, stab,
+                        s["lat"] - src["lat"], s["lng"] - src["lng"],
+                        w["direction"], src["lat"], Qrel, u, stab,
                     )
 
             # Calibrate against this hour's ACTUAL sensor TSP where available
@@ -547,6 +618,9 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
             denom = float(np.sum(pt_conc ** 2))
             cal = float(np.sum(pt_conc * obs) / denom) if denom > 1e-12 else 0.0
             hour_field *= cal
+            # Ambient background interpolated from unexplained TSP
+            residuals = obs - cal * pt_conc
+            hour_field += _background_field(lat_grid, lng_grid, sensors, residuals)
         else:
             # ── Legacy sensor-as-source hourly field ─────────────
             for si, s in enumerate(sensors):
