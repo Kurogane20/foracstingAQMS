@@ -688,6 +688,163 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
     }
 
 
+def _fetch_archive_wind_center(lat: float, lng: float, days: int, end_dt: datetime | None = None) -> dict[int, dict]:
+    """Hourly archive wind for one representative point, keyed by unix hour.
+    (Sync httpx — call via to_thread. ERA5 archive lags ~5 days.)"""
+    import httpx as _httpx
+    cap = datetime.now(timezone.utc) - timedelta(days=6)
+    end_ref = min(end_dt, cap) if end_dt else cap
+    end = end_ref.date()
+    start = end - timedelta(days=days)
+    resp = _httpx.get(
+        "https://archive-api.open-meteo.com/v1/archive",
+        params={
+            "latitude": lat, "longitude": lng,
+            "hourly": "wind_speed_10m,wind_direction_10m,cloudcover,precipitation",
+            "wind_speed_unit": "ms", "timezone": "UTC",
+            "start_date": start.isoformat(), "end_date": end.isoformat(),
+        },
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    h = resp.json().get("hourly", {})
+    out: dict[int, dict] = {}
+    for i, t in enumerate(h.get("time", [])):
+        dt = datetime.fromisoformat(t).replace(tzinfo=timezone.utc)
+        speed = h["wind_speed_10m"][i]
+        wdir = h["wind_direction_10m"][i]
+        if speed is None or wdir is None:
+            continue
+        out[int(dt.timestamp())] = {
+            "speed": max(float(speed), 0.5),
+            "direction": float(wdir),
+            "cloudcover": float(h["cloudcover"][i] or 50.0),
+            "precip": float(h["precipitation"][i] or 0.0),
+            "hour": (dt.hour + 8) % 24,   # WITA local clock
+        }
+    return out
+
+
+# Cache: the high-24h envelope is expensive and changes slowly
+_high24_cache: dict = {"key": None, "ts": 0.0, "data": None}
+_HIGH24_TTL = 6 * 3600.0
+
+
+async def compute_dispersion_high24(sensors: list[dict], days: int = 30) -> dict:
+    """
+    AERMOD-style "HIGH 1ST HIGH 24-HR" map: run the plume model over the past
+    `days` of archive wind + actual hourly TSP, take 24-hour rolling averages,
+    and keep the MAXIMUM at every grid cell. Because the wind visits many
+    directions over weeks, the envelope spreads in all directions — this is
+    the product consultant AERMOD maps show.
+    """
+    import time as _time
+
+    if not sensors:
+        return {"grid": [], "wind_vectors": [], "max_conc": 0.0,
+                "period": None, "updated_at": datetime.now(timezone.utc).isoformat()}
+
+    cache_key = (days, tuple(sorted(s["uid"] for s in sensors)))
+    if _high24_cache["data"] is not None and _high24_cache["key"] == cache_key \
+            and _time.time() - _high24_cache["ts"] < _HIGH24_TTL:
+        return _high24_cache["data"]
+
+    # Hourly TSP per sensor (generous window; anchor to last available hour)
+    tsp_per_sensor = await asyncio.gather(
+        *[asyncio.to_thread(get_hourly_tsp, s["uid"], (days + 10) * 24) for s in sensors],
+        return_exceptions=True,
+    )
+    tsp_per_sensor = [t if isinstance(t, dict) else {} for t in tsp_per_sensor]
+    latest_ts = max((max(t.keys()) for t in tsp_per_sensor if t), default=None)
+    latest_dt = datetime.fromtimestamp(latest_ts, tz=timezone.utc) if latest_ts else None
+
+    center_lat = float(np.mean([s["lat"] for s in sensors]))
+    center_lng = float(np.mean([s["lng"] for s in sensors]))
+    wind = await asyncio.to_thread(_fetch_archive_wind_center, center_lat, center_lng, days, latest_dt)
+    if not wind:
+        raise ValueError("Data angin archive kosong")
+
+    # Median TSP fallback per sensor for hours without readings
+    med_tsp = [
+        float(np.median(list(t.values()))) if t else 50.0
+        for t in tsp_per_sensor
+    ]
+
+    EXTENT = 0.25
+    STEP = 0.008
+    lats = [s["lat"] for s in sensors]
+    lngs = [s["lng"] for s in sensors]
+    lat_vals = np.arange(min(lats) - EXTENT, max(lats) + EXTENT + STEP, STEP)
+    lng_vals = np.arange(min(lngs) - EXTENT, max(lngs) + EXTENT + STEP, STEP)
+    lat_grid, lng_grid = np.meshgrid(lat_vals, lng_vals, indexing="ij")
+
+    envelope = np.zeros(lat_grid.shape, dtype=np.float64)
+    window: list[np.ndarray] = []
+    rolling = np.zeros(lat_grid.shape, dtype=np.float64)
+
+    def _hour_field_sync(w: dict, hour_unix: int) -> np.ndarray:
+        field_total = np.zeros(lat_grid.shape, dtype=np.float64)
+        u = w["speed"]
+        stab = _stability_class(u, w.get("cloudcover", 50.0), w.get("hour", 12))
+        wash = _washout_factor(w.get("precip", 0.0))
+        for si, s in enumerate(sensors):
+            Q = float(tsp_per_sensor[si].get(hour_unix, med_tsp[si]))
+            Q = max(Q, 1.0)
+            dlat = lat_grid - s["lat"]
+            dlng = lng_grid - s["lng"]
+            x_down, y_cross = _rotate_to_plume(dlat, dlng, w["direction"], s["lat"])
+            f = _plume_conc(x_down, y_cross, Q, u, stab, AREA_SIGMA0_Y, AREA_SIGMA0_Z)
+            fpeak = f.max()
+            if fpeak > 0:
+                field_total += f * (Q / fpeak) * wash
+        return field_total
+
+    def _compute_envelope() -> np.ndarray:
+        nonlocal rolling
+        env = np.zeros(lat_grid.shape, dtype=np.float64)
+        for hour_unix in sorted(wind.keys()):
+            f = _hour_field_sync(wind[hour_unix], hour_unix)
+            window.append(f)
+            rolling += f
+            if len(window) > 24:
+                rolling -= window.pop(0)
+            if len(window) == 24:
+                np.maximum(env, rolling / 24.0, out=env)
+        return env
+
+    envelope = await asyncio.to_thread(_compute_envelope)
+
+    peak = float(envelope.max())
+    if peak > 0:
+        envelope /= peak
+
+    THRESHOLD = 0.02
+    rows_i, cols_i = np.where(envelope >= THRESHOLD)
+    grid = [
+        [round(float(lat_grid[r, c]), 5), round(float(lng_grid[r, c]), 5), round(float(envelope[r, c]), 3)]
+        for r, c in zip(rows_i, cols_i)
+    ]
+
+    hours_sorted = sorted(wind.keys())
+    result = {
+        "grid": grid,
+        "wind_vectors": [
+            {"uid": s["uid"], "lat": s["lat"], "lng": s["lng"], "speed": 0.0, "direction": 0.0}
+            for s in sensors
+        ],
+        "max_conc": round(peak, 1),
+        "period": {
+            "start": datetime.fromtimestamp(hours_sorted[0], tz=timezone.utc).isoformat(),
+            "end":   datetime.fromtimestamp(hours_sorted[-1] + 3600, tz=timezone.utc).isoformat(),
+        },
+        "kind": "high24",
+        "days": days,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _high24_cache.update({"key": cache_key, "ts": _time.time(), "data": result})
+    return result
+
+
 async def compute_dispersion(sensors: list[dict]) -> dict:
     """
     Compute Gaussian plume superposition for all sensors.

@@ -8,6 +8,7 @@ from app.services.dispersion import (
     compute_dispersion,
     compute_dispersion_forecast,
     compute_dispersion_daily,
+    compute_dispersion_high24,
 )
 from app.services.source_inversion import run_source_inversion
 
@@ -53,6 +54,19 @@ async def get_dispersion_daily(body: DispersionRequest):
     Returns {"grid", "wind_vectors", "max_conc", "period", "updated_at"}.
     """
     return await compute_dispersion_daily([s.model_dump() for s in body.sensors])
+
+
+@router.post("/dispersion/high24", dependencies=[Depends(require_api_key)])
+async def get_dispersion_high24(body: DispersionRequest, days: int = 30):
+    """
+    AERMOD-style HIGH 1ST HIGH 24-HR envelope: max of 24-hour rolling averages
+    at every grid cell over the past `days` (archive wind + actual TSP).
+    Cached 6 hours — first call takes ~1 minute.
+    """
+    try:
+        return await compute_dispersion_high24([s.model_dump() for s in body.sensors], days)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.post("/sources/calibrate", dependencies=[Depends(require_api_key)])
