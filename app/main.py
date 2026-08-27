@@ -35,7 +35,7 @@ def _hourly_predict_worker() -> None:
     while True:
         _time.sleep(3600)
         try:
-            from app.db import get_all_uids, get_model_status
+            from app.db import get_all_uids
             from app.services.predict import predict_sensor
             from app.services.accuracy import resolve_prediction_actuals, check_and_auto_retrain
             uids = get_all_uids()
@@ -49,12 +49,10 @@ def _hourly_predict_worker() -> None:
             logger.info(f"[scheduler] Hourly predict complete for {len(uids)} sensors")
 
             # accuracy loop
-            status_map = {s["uid"]: s for s in get_model_status()}
             for uid in uids:
                 try:
                     resolve_prediction_actuals(uid)
-                    baseline = (status_map.get(uid) or {}).get("mae_score")
-                    check_and_auto_retrain(uid, baseline)
+                    check_and_auto_retrain(uid)
                 except Exception as e:
                     logger.error(f"[scheduler] accuracy check failed for {uid}: {e}")
             logger.info(f"[scheduler] Accuracy check complete for {len(uids)} sensors")

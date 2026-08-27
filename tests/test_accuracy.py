@@ -27,15 +27,68 @@ def _make_conn_mock():
 
 # fetch_actual_for_step
 
+def _hourly_row(**overrides) -> dict:
+    """Baris hasil agregasi AVG per jam, nilainya masuk akal secara fisik."""
+    row = {
+        "pm_25": 30.0, "pm_25_correction": 30.0,
+        "pm_10": 60.0, "pm_10_correction": 60.0,
+        "tsp": 90.0, "tsp_correction": 90.0,
+        "noise": 55.0, "temp": 28.0, "mmhg": 760.0, "humidity": 82.0,
+        "aqi_index_pm25": 40.0, "aqi_index_pm10": 45.0,
+        "aqi_index_tsp": 50.0, "aqi_index": 50.0,
+        "n_readings": 58,
+    }
+    row.update(overrides)
+    return row
+
+
 def test_fetch_actual_for_step_returns_dict_when_found():
     from app.services.accuracy import fetch_actual_for_step
     conn_mock, cursor_mock = _make_conn_mock()
-    cursor_mock.fetchone.return_value = {col: 50.0 for col in FEATURE_COLS}
+    cursor_mock.fetchone.return_value = _hourly_row()
     with patch("app.services.accuracy.mysql.connector.connect", return_value=conn_mock):
         result = fetch_actual_for_step(UID, TARGET_TIME)
     assert result is not None
-    assert "aqi_index" in result
-    assert isinstance(result["aqi_index"], float)
+    assert result["tsp"] == pytest.approx(90.0)
+    assert "n_readings" not in result       # metadata kueri, bukan parameter
+
+
+def test_fetch_actual_for_step_averages_the_target_hour():
+    """Model dilatih pada rata-rata per jam, jadi 'aktual' harus rata-rata jam
+    yang sama — bukan satu bacaan sesaat (selisih dua definisi itu 29,67 µg/m³)."""
+    from app.services.accuracy import fetch_actual_for_step
+    conn_mock, cursor_mock = _make_conn_mock()
+    cursor_mock.fetchone.return_value = _hourly_row()
+    with patch("app.services.accuracy.mysql.connector.connect", return_value=conn_mock):
+        fetch_actual_for_step(UID, TARGET_TIME)
+
+    sql, params = cursor_mock.execute.call_args[0]
+    assert "AVG(" in sql
+    target_unix = int(TARGET_TIME.replace(tzinfo=timezone.utc).timestamp())
+    assert params[1] == target_unix              # awal jam
+    assert params[2] == target_unix + 3600       # akhir jam, eksklusif
+
+
+def test_fetch_actual_for_step_rejects_hour_with_too_few_readings():
+    from app.services.accuracy import fetch_actual_for_step
+    conn_mock, cursor_mock = _make_conn_mock()
+    cursor_mock.fetchone.return_value = _hourly_row(n_readings=3)
+    with patch("app.services.accuracy.mysql.connector.connect", return_value=conn_mock):
+        assert fetch_actual_for_step(UID, TARGET_TIME) is None
+
+
+def test_fetch_actual_for_step_drops_physically_impossible_columns():
+    """5 dari 9 sensor tidak punya modul cuaca dan melaporkan 0. Model memprediksi
+    nilai cadangan (760 hPa), jadi galat konstan itu akan menenggelamkan metrik."""
+    from app.services.accuracy import fetch_actual_for_step
+    conn_mock, cursor_mock = _make_conn_mock()
+    cursor_mock.fetchone.return_value = _hourly_row(mmhg=0.0, temp=0.0, humidity=0.0)
+    with patch("app.services.accuracy.mysql.connector.connect", return_value=conn_mock):
+        result = fetch_actual_for_step(UID, TARGET_TIME)
+    assert "mmhg" not in result
+    assert "temp" not in result
+    assert "humidity" not in result
+    assert result["tsp"] == pytest.approx(90.0)
 
 
 def test_fetch_actual_for_step_returns_none_when_not_found():
@@ -98,32 +151,45 @@ def test_compute_accuracy_returns_empty_when_no_resolved():
 
 # detect_drift
 
-def test_detect_drift_returns_ratio():
+def test_detect_drift_flags_recent_errors_larger_than_history():
+    """Baris diurutkan target_time DESC, jadi DRIFT_WINDOW pertama = terkini."""
     from app.services.accuracy import detect_drift, DRIFT_WINDOW
-    rows = [_make_resolved_row(step=1, pred_val=50.0, act_val=60.0) for _ in range(DRIFT_WINDOW)]
+    recent = [_make_resolved_row(step=1, pred_val=50.0, act_val=110.0)
+              for _ in range(DRIFT_WINDOW)]                       # galat 60
+    history = [_make_resolved_row(step=1, pred_val=50.0, act_val=70.0)
+               for _ in range(DRIFT_WINDOW * 7)]                  # galat 20
+    with patch("app.services.accuracy.get_resolved_predictions", return_value=recent + history):
+        ratio = detect_drift(UID)
+    assert ratio == pytest.approx(3.0, abs=0.01)
+
+
+def test_detect_drift_stable_model_scores_near_one():
+    from app.services.accuracy import detect_drift, DRIFT_WINDOW
+    rows = [_make_resolved_row(step=1, pred_val=50.0, act_val=70.0)
+            for _ in range(DRIFT_WINDOW * 8)]
     with patch("app.services.accuracy.get_resolved_predictions", return_value=rows):
-        ratio = detect_drift(UID, baseline_mae=5.0)
-    assert ratio is not None
-    assert ratio > 1.0
+        ratio = detect_drift(UID)
+    assert ratio == pytest.approx(1.0, abs=0.01)
 
 
-def test_detect_drift_returns_none_when_no_baseline():
-    from app.services.accuracy import detect_drift
-    ratio = detect_drift(UID, baseline_mae=None)
-    assert ratio is None
-
-
-def test_detect_drift_returns_none_when_baseline_zero():
-    from app.services.accuracy import detect_drift
-    ratio = detect_drift(UID, baseline_mae=0.0)
-    assert ratio is None
+def test_detect_drift_compares_like_with_like():
+    """Regresi: sebelumnya galat produksi (µg/m³) dibandingkan dengan mae_score
+    hasil pelatihan (ruang ternormalisasi 0–1) — beda ~3 orde besaran, sehingga
+    rasionya selalu jauh di atas ambang dan auto-retrain terpicu terus-menerus.
+    Model yang tidak berubah harus menghasilkan skor jauh di bawah ambang."""
+    from app.services.accuracy import detect_drift, DRIFT_WINDOW, DRIFT_THRESHOLD
+    rows = [_make_resolved_row(step=1, pred_val=50.0, act_val=80.0)
+            for _ in range(DRIFT_WINDOW * 8)]
+    with patch("app.services.accuracy.get_resolved_predictions", return_value=rows):
+        ratio = detect_drift(UID)
+    assert ratio < DRIFT_THRESHOLD
 
 
 def test_detect_drift_returns_none_when_insufficient_data():
     from app.services.accuracy import detect_drift, DRIFT_WINDOW
-    rows = [_make_resolved_row(step=1) for _ in range(DRIFT_WINDOW - 1)]
+    rows = [_make_resolved_row(step=1) for _ in range(DRIFT_WINDOW * 2 - 1)]
     with patch("app.services.accuracy.get_resolved_predictions", return_value=rows):
-        ratio = detect_drift(UID, baseline_mae=5.0)
+        ratio = detect_drift(UID)
     assert ratio is None
 
 
@@ -139,7 +205,7 @@ def test_check_and_auto_retrain_triggers_thread_on_drift():
          patch("app.services.accuracy.update_drift_metadata"), \
          patch("app.services.accuracy.upsert_metadata") as mock_upsert, \
          patch.object(threading.Thread, "start", capture_start):
-        result = check_and_auto_retrain(UID, baseline_mae=5.0)
+        result = check_and_auto_retrain(UID)
     assert result is True
     assert len(started_threads) == 1
     mock_upsert.assert_called_once_with(UID, status="drifted")
@@ -151,6 +217,6 @@ def test_check_and_auto_retrain_no_trigger_below_threshold():
     with patch("app.services.accuracy.detect_drift", return_value=low_ratio), \
          patch("app.services.accuracy.update_drift_metadata"), \
          patch("app.services.accuracy.upsert_metadata") as mock_upsert:
-        result = check_and_auto_retrain(UID, baseline_mae=5.0)
+        result = check_and_auto_retrain(UID)
     assert result is False
     mock_upsert.assert_not_called()

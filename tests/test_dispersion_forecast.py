@@ -94,3 +94,41 @@ class TestComputeDispersionForecast:
         for frame in result["frames"]:
             for point in frame["grid"]:
                 assert 0.0 <= point[2] <= 1.0
+
+    def test_p90_field_scales_with_upper_bound(self):
+        """Kanal peringatan memakai kuantil 0,9 sebagai kekuatan sumber, jadi
+        puncaknya harus sebanding dengan rasio tsp_p90/tsp."""
+        sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0,
+                    "pm25": 50.0, "tsp": 100.0, "tsp_p90": 300.0}]
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
+            inst = MockClient.return_value.__aenter__.return_value
+            inst.get = AsyncMock(return_value=_mock_forecast_response())
+            result = run(compute_dispersion_forecast(sensors))
+
+        for frame in result["frames"]:
+            assert frame["max_conc_p90"] == pytest.approx(3.0 * frame["max_conc"], rel=1e-3)
+
+    def test_p90_absent_when_upper_bound_not_supplied(self):
+        """Tanpa tsp_p90 tidak boleh ada uplift palsu — klien harus jatuh kembali
+        ke max_conc, bukan memakai angka yang dikarang."""
+        sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0, "pm25": 50.0, "tsp": 100.0}]
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
+            inst = MockClient.return_value.__aenter__.return_value
+            inst.get = AsyncMock(return_value=_mock_forecast_response())
+            result = run(compute_dispersion_forecast(sensors))
+
+        for frame in result["frames"]:
+            assert frame["max_conc_p90"] == 0.0
+
+    def test_p90_never_below_point_forecast(self):
+        """Batas atas yang lebih kecil dari prakiraan titik (mis. model belum
+        terlatih) tidak boleh menurunkan ambang peringatan."""
+        sensors = [{"uid": "S1", "lat": -1.0, "lng": 116.0,
+                    "pm25": 50.0, "tsp": 200.0, "tsp_p90": 50.0}]
+        with patch("app.services.dispersion.httpx.AsyncClient") as MockClient:
+            inst = MockClient.return_value.__aenter__.return_value
+            inst.get = AsyncMock(return_value=_mock_forecast_response())
+            result = run(compute_dispersion_forecast(sensors))
+
+        for frame in result["frames"]:
+            assert frame["max_conc_p90"] == 0.0

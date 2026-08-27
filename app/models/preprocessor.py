@@ -9,6 +9,7 @@ from app.config import (
     SENSOR_DB_CONFIG, FEATURE_COLS, TIME_COLS, METEO_COLS,
     N_FEATURES, N_INPUT_HOURS, N_FORECAST_HOURS,
     TRAIN_HISTORY_HOURS, MODELS_DIR,
+    PHYSICAL_LIMITS, LOG_SCALE_COLS, FEATURE_SCHEMA_VERSION,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,27 +48,44 @@ def resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_and_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
+    """Buang hanya nilai yang mustahil secara fisik, lalu interpolasi lubangnya.
+
+    Sebelumnya fungsi ini memakai ambang 3-sigma terhadap median bergulir 24 jam.
+    Masalahnya, kejadian debu nyata yang berlangsung beberapa jam PASTI melewati
+    ambang itu — jadi penyaringnya justru menghapus persis kejadian yang ingin
+    diprediksi. Penyaring statistik tidak bisa membedakan sensor rusak dari hari
+    berdebu; batas fisik bisa.
+    """
     df = df.copy()
     for col in df.columns:
-        rolling_median = df[col].rolling(N_INPUT_HOURS, min_periods=1, center=True).median()
-        rolling_std = df[col].rolling(N_INPUT_HOURS, min_periods=1, center=True).std().fillna(1.0)
-        anomaly_mask = (df[col] - rolling_median).abs() > 3 * rolling_std
-        df.loc[anomaly_mask, col] = np.nan
+        limits = PHYSICAL_LIMITS.get(col)
+        if limits is None:
+            continue
+        lo, hi, _ = limits
+        df.loc[(df[col] < lo) | (df[col] > hi), col] = np.nan
         df[col] = df[col].interpolate(method="linear").ffill().bfill()
     return df
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Isi sisa lubang. TIDAK ada pemotongan outlier di sini — lihat catatan
+    PHYSICAL_LIMITS di config: pemotongan Tukey yang lama menghapus 59% jam
+    pelampauan baku mutu sebelum model sempat melihatnya."""
     df = df.copy()
     df = df.interpolate(method="linear")
     df = df.ffill().bfill()
-    if df.isnull().any().any():
-        raise ValueError("DataFrame still contains NaN after fill — check for all-null sensor columns")
+
+    # Kolom yang kosong total (mis. sensor tanpa modul cuaca) tidak bisa
+    # diinterpolasi; pakai nilai cadangan agar retrain tidak gagal total.
     for col in df.columns:
-        q1 = df[col].quantile(0.25)
-        q3 = df[col].quantile(0.75)
-        iqr = q3 - q1
-        df[col] = df[col].clip(lower=q1 - 1.5 * iqr, upper=q3 + 1.5 * iqr)
+        limits = PHYSICAL_LIMITS.get(col)
+        if limits is not None and df[col].isnull().all():
+            df[col] = limits[2]
+            logger.warning(f"Kolom '{col}' kosong seluruhnya — diisi cadangan {limits[2]}")
+
+    if df.isnull().any().any():
+        bad = df.columns[df.isnull().any()].tolist()
+        raise ValueError(f"Masih ada NaN setelah pengisian pada kolom: {bad}")
     return df
 
 
@@ -81,21 +99,62 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+_LOG_IDX = [FEATURE_COLS.index(c) for c in LOG_SCALE_COLS]
+
+
+def _to_log_space(values: np.ndarray) -> np.ndarray:
+    out = values.astype(np.float64).copy()
+    out[:, _LOG_IDX] = np.log1p(np.clip(out[:, _LOG_IDX], 0.0, None))
+    return out
+
+
+def _from_log_space(values: np.ndarray) -> np.ndarray:
+    out = values.astype(np.float64).copy()
+    out[:, _LOG_IDX] = np.expm1(np.clip(out[:, _LOG_IDX], 0.0, None))
+    return out
+
+
+def _load_scaler(uid: str):
+    """Muat scaler beserta versi skemanya.
+
+    joblib.load memakai pickle; berkas ini ditulis sendiri oleh proses retrain ke
+    MODELS_DIR milik aplikasi dan tidak pernah berasal dari input pengguna, jadi
+    aman. Pola ini sudah dipakai sejak awal, tidak berubah di sini.
+
+    Scaler lama (objek MinMaxScaler polos)
+    dipasang pada data linier terpotong, jadi menerapkan expm1 padanya akan
+    menghasilkan angka ngawur — lebih baik gagal dengan pesan jelas."""
+    scaler_path = os.path.join(MODELS_DIR, uid, "scaler.pkl")
+    blob = joblib.load(scaler_path)
+    if not isinstance(blob, dict) or blob.get("schema") != FEATURE_SCHEMA_VERSION:
+        found = blob.get("schema") if isinstance(blob, dict) else "pra-versi"
+        raise ValueError(
+            f"[{uid}] Scaler tersimpan memakai skema {found}, versi saat ini "
+            f"{FEATURE_SCHEMA_VERSION}. Skema fitur/target sudah berubah — "
+            f"jalankan retrain untuk uid ini."
+        )
+    return blob["scaler"]
+
+
 def normalize(df: pd.DataFrame, uid: str, fit: bool = False) -> tuple:
-    """Normalize only FEATURE_COLS with MinMaxScaler; TIME_COLS pass through unchanged."""
+    """Skalakan FEATURE_COLS ke [0,1]; TIME_COLS lewat tanpa diubah.
+    Kolom konsentrasi dilewatkan log1p lebih dulu (lihat LOG_SCALE_COLS)."""
     scaler_path = os.path.join(MODELS_DIR, uid, "scaler.pkl")
     os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
 
-    sensor_df = df[FEATURE_COLS]
+    sensor_values = _to_log_space(df[FEATURE_COLS].values)
     extra_cols = [c for c in df.columns if c not in FEATURE_COLS]
 
     if fit:
         scaler = MinMaxScaler()
-        scaled = scaler.fit_transform(sensor_df.values)
-        joblib.dump(scaler, scaler_path)
+        scaled = scaler.fit_transform(sensor_values)
+        joblib.dump(
+            {"scaler": scaler, "schema": FEATURE_SCHEMA_VERSION, "log_cols": LOG_SCALE_COLS},
+            scaler_path,
+        )
     else:
-        scaler = joblib.load(scaler_path)
-        scaled = scaler.transform(sensor_df.values)
+        scaler = _load_scaler(uid)
+        scaled = scaler.transform(sensor_values)
 
     result = pd.DataFrame(scaled, columns=FEATURE_COLS, index=df.index)
     if extra_cols:
@@ -104,9 +163,39 @@ def normalize(df: pd.DataFrame, uid: str, fit: bool = False) -> tuple:
 
 
 def denormalize(arr: np.ndarray, uid: str) -> np.ndarray:
-    scaler_path = os.path.join(MODELS_DIR, uid, "scaler.pkl")
-    scaler = joblib.load(scaler_path)
-    return scaler.inverse_transform(arr)
+    scaler = _load_scaler(uid)
+    return _from_log_space(scaler.inverse_transform(arr))
+
+
+# ── Prakiraan selisih (delta) ────────────────────────────────────────────────
+#
+# Model sebelumnya meramal LEVEL absolut dan tidak punya jalur langsung ke nilai
+# terakhir teramati: tahap LightGBM hanya menerima keluaran BiLSTM + fitur
+# kalender. Akibatnya terukur — model kalah dari tebakan naif "nilai H+h = nilai
+# sekarang" sebesar 67% di H+1, justru di horizon tempat nilai terakhir paling
+# informatif.
+#
+# Dengan meramal selisih terhadap nilai terakhir, persistence menjadi perilaku
+# BAWAAN model (delta = 0), dan ia hanya perlu mempelajari simpangannya. Secara
+# struktural model tidak bisa lagi kalah telak dari baseline.
+#
+# Catatan: ruang ternormalisasi ini log1p→MinMax, jadi selisih di sini setara
+# rasio dalam satuan fisik — bentuk yang memang tepat untuk konsentrasi.
+
+
+def anchor_from_X(X: np.ndarray) -> np.ndarray:
+    """Nilai sensor terakhir yang teramati pada tiap jendela. (N, N_FEATURES)"""
+    return X[:, -1, :N_FEATURES]
+
+
+def to_delta(y_abs: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    """Level absolut → selisih terhadap jangkar. y: (N, n_out, N_FEATURES)"""
+    return y_abs - anchor[:, np.newaxis, :]
+
+
+def from_delta(y_delta: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+    """Selisih → level absolut (kebalikan to_delta)."""
+    return y_delta + anchor[:, np.newaxis, :]
 
 
 def create_sequences(data: np.ndarray, n_in: int, n_out: int,

@@ -91,7 +91,8 @@ def test_tune_lgbm_returns_correct_keys(tmp_path, monkeypatch):
     base_times = [pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i) for i in range(N)]
 
     mock_model = MagicMock()
-    # predict returns shape (N_FORECAST_HOURS, N_FEATURES); [0] picks first row
+    # predict returns shape (N_FORECAST_HOURS, N_FEATURES) per call;
+    # preds will be assembled to (N, N_FORECAST_HOURS, N_FEATURES) matching y_true
     mock_model.predict.return_value = np.zeros((N_FORECAST_HOURS, N_FEATURES))
 
     with patch("app.models.tuning.train_lgbm") as mock_train, \
@@ -99,7 +100,8 @@ def test_tune_lgbm_returns_correct_keys(tmp_path, monkeypatch):
 
         from app.models.tuning import tune_lgbm, LGBM_TRIALS
 
-        result = tune_lgbm(bilstm_preds, y_true, base_times, "uid_lgbm")
+        anchors = np.random.randn(N, N_FEATURES)
+        result = tune_lgbm(bilstm_preds, y_true, base_times, "uid_lgbm", anchors=anchors)
 
     assert isinstance(result, dict)
     assert "n_estimators" in result

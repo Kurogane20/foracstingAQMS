@@ -1,8 +1,71 @@
+# ─────────────────────────────────────────────────────────────
+#  air_quality_forecast — .gitignore
+#  Aturan: yang DIHASILKAN ulang tidak masuk repo; yang menjadi
+#  SUMBER kebenaran masuk. Rahasia tidak pernah masuk.
+# ─────────────────────────────────────────────────────────────
+
+# ── Rahasia & kredensial ──────────────────────────────────────
+# .env memuat sandi basis data produksi. Server punya .env sendiri.
 .env
-saved_models/**/*.keras
-saved_models/**/*.pkl
-__pycache__/
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ── Lingkungan & bytecode Python ──────────────────────────────
 venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# ── Artefak model ─────────────────────────────────────────────
+# Seluruh isi saved_models/ dihasilkan oleh retrain (~803 MB):
+# bilstm.keras, lgbm*.pkl, scaler.pkl, shrinkage.json, best_params.
+# Struktur foldernya dipertahankan lewat .gitkeep.
+saved_models/*
+!saved_models/.gitkeep
+
+# ── Uji, cakupan, dan cache linter ────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# ── Log ───────────────────────────────────────────────────────
 logs/*
 !logs/.gitkeep
-=3.6
+*.log
+
+# ── Keluaran skrip presentasi ─────────────────────────────────
+# Dihasilkan oleh generate_*.py yang ada di repo ini.
+# CATATAN: bila berkas .pptx pernah disunting manual, keluarkan
+# baris ini — kalau tidak, hasil suntingan tidak akan terlacak.
+*.pptx
+
+# ── Berkas kerja sementara ────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+scratch/
+tmp/
+
+# ── Editor ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Sistem operasi & OneDrive ─────────────────────────────────
+# Proyek ini berada di dalam OneDrive; desktop.ini muncul sendiri.
+.DS_Store
+Thumbs.db
+desktop.ini

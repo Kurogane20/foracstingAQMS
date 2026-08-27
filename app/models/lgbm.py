@@ -7,13 +7,28 @@ from sklearn.multioutput import MultiOutputRegressor
 from app.config import N_FORECAST_HOURS, N_FEATURES, MODELS_DIR
 
 
-def build_lgbm_features(bilstm_output: np.ndarray, base_time: pd.Timestamp) -> np.ndarray:
+def build_lgbm_features(
+    bilstm_output: np.ndarray,
+    base_time: pd.Timestamp,
+    anchor: np.ndarray,
+) -> np.ndarray:
+    """Fitur tahap koreksi: prakiraan selisih BiLSTM + jangkar + kalender.
+
+    `anchor` (nilai sensor terakhir teramati, ternormalisasi) wajib ada di sini.
+    Sebelumnya tahap ini hanya melihat keluaran BiLSTM dan fitur kalender, jadi
+    ia tidak tahu sedang berada di level konsentrasi berapa — koreksi yang tepat
+    untuk hari 30 µg/m³ jelas berbeda dari hari 400 µg/m³.
+    """
     rows = []
     for step in range(N_FORECAST_HOURS):
         t = base_time + pd.Timedelta(hours=step + 1)
         time_feats = [t.hour, t.dayofweek, t.month]
-        rows.append(np.concatenate([bilstm_output[step], time_feats]))
+        rows.append(np.concatenate([bilstm_output[step], anchor, time_feats]))
     return np.array(rows)
+
+
+# 14 selisih BiLSTM + 14 jangkar + 3 kalender
+N_LGBM_FEATURES = N_FEATURES * 2 + 3
 
 
 def train_lgbm(
@@ -21,11 +36,12 @@ def train_lgbm(
     y_true: np.ndarray,
     base_times: list,
     uid: str,
+    anchors: np.ndarray,
     lgbm_params: dict = None,
 ) -> None:
     X_all, y_all = [], []
     for i, bt in enumerate(base_times):
-        feats = build_lgbm_features(bilstm_preds[i], bt)
+        feats = build_lgbm_features(bilstm_preds[i], bt, anchors[i])
         X_all.append(feats)
         y_all.append(y_true[i])
     X_all = np.vstack(X_all)
@@ -56,10 +72,28 @@ def predict_lgbm(
     bilstm_output: np.ndarray,
     base_time: pd.Timestamp,
     uid: str,
+    anchor: np.ndarray,
 ) -> dict:
-    X = build_lgbm_features(bilstm_output, base_time)
+    X = build_lgbm_features(bilstm_output, base_time, anchor)
     result = {}
     for key, suffix in [("point", ""), ("lower", "_lower"), ("upper", "_upper")]:
         path = os.path.join(MODELS_DIR, uid, f"lgbm{suffix}.pkl")
-        result[key] = joblib.load(path).predict(X) if os.path.exists(path) else None
+        if not os.path.exists(path):
+            result[key] = None
+            continue
+        # joblib.load memakai pickle; berkas ini ditulis sendiri oleh proses
+        # retrain ke MODELS_DIR milik aplikasi, tidak pernah dari input pengguna.
+        model = joblib.load(path)
+
+        # Model lama dilatih pada 17 fitur (tanpa jangkar) dan meramal level
+        # absolut, bukan selisih. Memuatnya di sini akan gagal dengan galat
+        # bentuk LightGBM yang tidak menjelaskan apa-apa.
+        n_in = getattr(model.estimators_[0], "n_features_in_", N_LGBM_FEATURES)
+        if n_in != N_LGBM_FEATURES:
+            raise ValueError(
+                f"[{uid}] Model LightGBM tersimpan mengharapkan {n_in} fitur, "
+                f"skema saat ini {N_LGBM_FEATURES}. Model kini meramal SELISIH "
+                f"terhadap nilai terakhir — jalankan retrain untuk uid ini."
+            )
+        result[key] = model.predict(X)
     return result

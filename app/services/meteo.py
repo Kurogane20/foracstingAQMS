@@ -6,6 +6,16 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+HOURLY_VARS = "wind_speed_10m,wind_direction_10m,cloudcover,precipitation"
+
+# Penekanan debu oleh hujan menjenuh dengan cepat: pada ~5 mm/jam permukaan
+# sudah basah total dan tambahan hujan hampir tidak menurunkan TSP lagi.
+# Menormalkan dengan pembagi besar akan menggencet seluruh hujan ringan-sedang
+# ke angka mendekati nol dan menghilangkan sinyalnya.
+_PRECIP_SATURATION_MM = 5.0
+_PRECIP_3H_SATURATION_MM = 10.0
+
+
 def _build_meteo_df(data: dict) -> pd.DataFrame:
     hourly = data.get("hourly", {})
     raw_times = pd.to_datetime(hourly["time"])
@@ -13,12 +23,20 @@ def _build_meteo_df(data: dict) -> pd.DataFrame:
     wind_speeds  = pd.Series(hourly["wind_speed_10m"]).fillna(0.0).values
     wind_dirs    = pd.Series(hourly["wind_direction_10m"]).fillna(0.0).values
     cloudcovers  = pd.Series(hourly["cloudcover"]).fillna(0.0).values
+    precip       = pd.Series(hourly.get("precipitation") or [0.0] * len(times)).fillna(0.0)
+
+    # Permukaan tetap basah setelah hujan berhenti, jadi TSP masih tertekan
+    # selama beberapa jam. Curah hujan sesaat saja tidak menangkap efek sisa itu.
+    precip_3h = precip.rolling(3, min_periods=1).sum()
+
     return pd.DataFrame(
         {
             "meteo_wind_speed":   [min(s / 20.0, 1.0) for s in wind_speeds],
             "meteo_wind_dir_sin": [math.sin(math.radians(d)) for d in wind_dirs],
             "meteo_wind_dir_cos": [math.cos(math.radians(d)) for d in wind_dirs],
             "meteo_cloudcover":   [min(c / 100.0, 1.0) for c in cloudcovers],
+            "meteo_precip":       (precip / _PRECIP_SATURATION_MM).clip(upper=1.0).values,
+            "meteo_precip_3h":    (precip_3h / _PRECIP_3H_SATURATION_MM).clip(upper=1.0).values,
         },
         index=times,
     )
@@ -50,7 +68,7 @@ def fetch_meteo_training(lat: float, lng: float, timestamps: pd.DatetimeIndex) -
                 "longitude":       lng,
                 "start_date":      start,
                 "end_date":        end,
-                "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
+                "hourly":          HOURLY_VARS,
                 "wind_speed_unit": "ms",
                 "timezone":        "UTC",
             },
@@ -76,7 +94,7 @@ def fetch_meteo_predict(lat: float, lng: float, timestamps: pd.DatetimeIndex) ->
             params={
                 "latitude":        lat,
                 "longitude":       lng,
-                "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover",
+                "hourly":          HOURLY_VARS,
                 "wind_speed_unit": "ms",
                 "timezone":        "UTC",
                 "forecast_days":   1,

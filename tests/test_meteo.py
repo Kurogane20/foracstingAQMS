@@ -3,11 +3,10 @@ import pandas as pd
 import pytest
 from unittest.mock import patch, MagicMock
 from app.services.meteo import fetch_meteo_training, fetch_meteo_predict
+from app.config import METEO_COLS
 
-METEO_COLS = ["meteo_wind_speed", "meteo_wind_dir_sin", "meteo_wind_dir_cos", "meteo_cloudcover"]
 
-
-def _mock_response(wind_speeds, wind_dirs, cloudcovers, times):
+def _mock_response(wind_speeds, wind_dirs, cloudcovers, times, precip=None):
     mock_resp = MagicMock()
     mock_resp.raise_for_status = lambda: None
     mock_resp.json.return_value = {
@@ -16,6 +15,7 @@ def _mock_response(wind_speeds, wind_dirs, cloudcovers, times):
             "wind_speed_10m": wind_speeds,
             "wind_direction_10m": wind_dirs,
             "cloudcover": cloudcovers,
+            "precipitation": [0.0] * len(times) if precip is None else precip,
         }
     }
     return mock_resp
@@ -77,6 +77,58 @@ class TestFetchMeteoTraining:
             df = fetch_meteo_training(lat=-1.0, lng=116.0, timestamps=timestamps)
 
         assert df["meteo_cloudcover"].iloc[0] == pytest.approx(0.75)
+
+    def test_precip_normalised_and_saturates(self):
+        """Hujan ringan harus tetap terbaca; di atas 5 mm/jam menjenuh di 1.0."""
+        times = ["2024-01-01T00:00", "2024-01-01T01:00", "2024-01-01T02:00"]
+        timestamps = pd.DatetimeIndex(pd.to_datetime(times))
+        mock_resp = _mock_response([1.0] * 3, [0.0] * 3, [50.0] * 3, times,
+                                   precip=[0.0, 2.5, 40.0])
+
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.get.return_value = mock_resp
+            df = fetch_meteo_training(lat=-1.0, lng=116.0, timestamps=timestamps)
+
+        assert df["meteo_precip"].iloc[0] == pytest.approx(0.0)
+        assert df["meteo_precip"].iloc[1] == pytest.approx(0.5)
+        assert df["meteo_precip"].iloc[2] == pytest.approx(1.0)   # dijenuhkan
+
+    def test_precip_3h_keeps_signal_after_rain_stops(self):
+        """Jam ketiga tidak hujan, tapi akumulasi 3 jam harus tetap > 0 —
+        permukaan masih basah, itulah yang menekan TSP."""
+        times = [f"2024-01-01T{h:02d}:00" for h in range(4)]
+        timestamps = pd.DatetimeIndex(pd.to_datetime(times))
+        mock_resp = _mock_response([1.0] * 4, [0.0] * 4, [50.0] * 4, times,
+                                   precip=[4.0, 0.0, 0.0, 0.0])
+
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.get.return_value = mock_resp
+            df = fetch_meteo_training(lat=-1.0, lng=116.0, timestamps=timestamps)
+
+        assert df["meteo_precip"].iloc[2] == pytest.approx(0.0)      # sudah berhenti
+        assert df["meteo_precip_3h"].iloc[2] == pytest.approx(0.4)   # jejak masih ada
+        assert df["meteo_precip_3h"].iloc[3] == pytest.approx(0.0)   # keluar jendela
+
+    def test_missing_precipitation_key_defaults_to_zero(self):
+        """API lama / respons tanpa kolom hujan tidak boleh membuat retrain gagal."""
+        times = ["2024-01-01T00:00", "2024-01-01T01:00"]
+        timestamps = pd.DatetimeIndex(pd.to_datetime(times))
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json.return_value = {
+            "hourly": {
+                "time": times,
+                "wind_speed_10m": [1.0, 1.0],
+                "wind_direction_10m": [0.0, 0.0],
+                "cloudcover": [50.0, 50.0],
+            }
+        }
+        with patch("httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value.get.return_value = mock_resp
+            df = fetch_meteo_training(lat=-1.0, lng=116.0, timestamps=timestamps)
+
+        assert list(df.columns) == METEO_COLS
+        assert df["meteo_precip"].sum() == 0.0
 
 
 class TestFetchMeteoPredict:

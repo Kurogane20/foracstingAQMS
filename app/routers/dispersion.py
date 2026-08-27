@@ -21,6 +21,9 @@ class SensorInput(BaseModel):
     lng:   float
     pm25:  float = Field(default=50.0, ge=0)
     tsp:   float = Field(default=100.0, ge=0)
+    # Batas atas prakiraan (kuantil 0,9) untuk parameter TSP. Opsional: bila
+    # tidak dikirim, medan peringatan sama dengan medan prakiraan titik.
+    tsp_p90: float | None = Field(default=None, ge=0)
 
 
 class DispersionRequest(BaseModel):

@@ -326,6 +326,16 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
 
     for h in range(hours + 1):
         total = np.zeros(lat_grid.shape, dtype=np.float64)
+        # Medan paralel memakai batas atas prakiraan (kuantil 0,9) sebagai kekuatan
+        # sumber. Dipakai KHUSUS untuk peringatan dini, bukan untuk peta.
+        #
+        # Alasannya terukur: prakiraan titik dioptimalkan dengan MSE sehingga
+        # menghasilkan rata-rata bersyarat — saat TSP aktual melampaui baku mutu
+        # (rata-rata 431 µg/m³), prakiraan titik rata-rata hanya 128, dan hanya 4%
+        # pelampauan yang terdeteksi. Untuk keputusan "perlu bertindak atau tidak",
+        # kuantil atas adalah besaran yang tepat; prakiraan titik memang dirancang
+        # untuk tidak pernah ekstrem.
+        total_hi = np.zeros(lat_grid.shape, dtype=np.float64)
         wind_vectors = []
         hour_params = []   # per-sensor params for cross-sensor validation
 
@@ -417,6 +427,11 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                 scale *= _washout_factor(w.get("precip", 0.0))
                 total += field * scale
 
+                # Bentuk spasialnya identik (plume linear terhadap Q), hanya
+                # bobotnya berbeda — jadi medan p90 nyaris gratis.
+                Q_hi = max(float(s.get("tsp_p90") or 0.0), Q)
+                total_hi += field * scale * (Q_hi / Q)
+
                 hour_params.append({
                     "uid": s["uid"], "lat": s["lat"], "lng": s["lng"],
                     "Q": Q, "u": u, "stab": stab,
@@ -445,6 +460,7 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
                     })
 
         peak = total.max()
+        peak_hi = float(total_hi.max())
         if peak > 0:
             total /= peak
 
@@ -467,6 +483,10 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             # Peak physical concentration (µg/m³, TSP-calibrated) — multiply the
             # normalized grid intensity by this to recover absolute values.
             "max_conc":     round(float(peak), 1),
+            # Versi kuantil-0,9 dari besaran yang sama, untuk ambang peringatan.
+            # Nol bila batas atas prakiraan tidak tersedia (mode inversi, atau
+            # `tsp_p90` tidak dikirim) — klien harus kembali ke `max_conc`.
+            "max_conc_p90": round(peak_hi, 1) if peak_hi > peak else 0.0,
         })
 
     # Fire-and-forget: log validation rows + resolve past actuals off-thread

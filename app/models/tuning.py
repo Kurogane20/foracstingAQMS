@@ -5,7 +5,7 @@ import optuna
 import joblib
 import pandas as pd
 from app.config import MODELS_DIR, N_FORECAST_HOURS
-from app.models.bilstm import train_bilstm, predict_bilstm
+from app.models.bilstm import train_bilstm, predict_bilstm, _model_cache
 from app.models.lgbm import train_lgbm, build_lgbm_features
 
 
@@ -45,6 +45,7 @@ def tune_bilstm(X: np.ndarray, y: np.ndarray, uid: str) -> dict:
 
         train_bilstm(X_train, y_train, uid, units=units, dropout=dropout,
                      batch_size=batch_size, epochs=30, patience=5)
+        _model_cache.pop(uid, None)  # force reload of just-saved model
 
         preds = np.array([predict_bilstm(X_val[i:i+1], uid)[0] for i in range(len(X_val))])
         return float(np.mean(np.abs(preds - y_val)))
@@ -55,8 +56,12 @@ def tune_bilstm(X: np.ndarray, y: np.ndarray, uid: str) -> dict:
 
 
 def tune_lgbm(bilstm_preds: np.ndarray, y_true: np.ndarray,
-              base_times: list, uid: str) -> dict:
-    """Run Optuna tuning for LightGBM. Returns best params dict."""
+              base_times: list, uid: str, anchors: np.ndarray) -> dict:
+    """Run Optuna tuning for LightGBM. Returns best params dict.
+
+    `y_true` dan `bilstm_preds` di sini berada dalam ruang SELISIH, dan `anchors`
+    adalah nilai terakhir teramati per jendela — sama seperti jalur pelatihan.
+    """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def objective(trial):
@@ -65,14 +70,15 @@ def tune_lgbm(bilstm_preds: np.ndarray, y_true: np.ndarray,
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
             "num_leaves": trial.suggest_int("num_leaves", 31, 127),
         }
-        train_lgbm(bilstm_preds, y_true, base_times, uid, lgbm_params=params)
-
+        train_lgbm(bilstm_preds, y_true, base_times, uid,
+                   anchors=anchors, lgbm_params=params)
+        model = joblib.load(os.path.join(MODELS_DIR, uid, "lgbm.pkl"))
         preds = np.array([
-            joblib.load(os.path.join(MODELS_DIR, uid, "lgbm.pkl"))
-            .predict(build_lgbm_features(bilstm_preds[i], base_times[i]))[0]
+            model.predict(build_lgbm_features(bilstm_preds[i], base_times[i], anchors[i]))
             for i in range(len(bilstm_preds))
         ])
-        return float(np.mean(np.abs(preds - y_true[:, 0, :])))
+        # preds shape: (N, 6, 14); y_true shape: (N, 6, 14)
+        return float(np.mean(np.abs(preds - y_true)))
 
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=LGBM_TRIALS)

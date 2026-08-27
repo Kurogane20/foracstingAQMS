@@ -23,11 +23,39 @@ def test_clean_fills_missing_values(sample_hourly_df):
     assert not result.isnull().any().any()
 
 
-def test_clean_caps_outliers(sample_hourly_df):
+def test_clean_preserves_real_exceedance():
+    """Regresi: pemotongan Tukey yang lama membuang 59% jam pelampauan baku mutu
+    (pagar per sensor 89–252 µg/m³ vs baku mutu 230), sehingga model tidak pernah
+    melihat kejadian yang paling perlu diprediksi. Puncak nyata harus lolos utuh."""
+    n = 200
+    index = pd.date_range("2024-01-01", periods=n, freq="h")
+    df = pd.DataFrame({col: np.full(n, 40.0) for col in FEATURE_COLS}, index=index)
+    df["temp"] = 28.0
+    df["mmhg"] = 760.0
+    df["humidity"] = 82.0
+    df["noise"] = 55.0
+    df.loc[df.index[100], "tsp"] = 420.0      # kejadian debu nyata di atas baku mutu
+
+    result = clean(detect_and_remove_anomalies(df))
+
+    assert result.loc[df.index[100], "tsp"] == pytest.approx(420.0)
+
+
+def test_clean_rejects_physically_impossible_value(sample_hourly_df):
     df = sample_hourly_df.copy()
-    df.iloc[0, 0] = 999999.0
-    result = clean(df)
-    assert result.iloc[0, 0] < 999999.0
+    df.loc[df.index[0], "tsp"] = 999999.0     # mustahil: sensor rusak
+    result = clean(detect_and_remove_anomalies(df))
+    assert result.loc[df.index[0], "tsp"] < 999999.0
+
+
+def test_clean_fills_column_that_is_entirely_invalid(sample_hourly_df):
+    """Sebagian sensor tidak punya modul cuaca dan melaporkan nol terus-menerus.
+    Kolom seperti itu harus diisi nilai cadangan, bukan menggagalkan retrain."""
+    df = sample_hourly_df.copy()
+    df["mmhg"] = 0.0                          # di luar batas fisik seluruhnya
+    result = clean(detect_and_remove_anomalies(df))
+    assert not result.isnull().any().any()
+    assert result["mmhg"].iloc[0] == pytest.approx(760.0)
 
 
 def test_create_sequences_output_shapes(sample_sequence_data):
@@ -43,23 +71,71 @@ def test_create_sequences_values_are_contiguous(sample_sequence_data):
     np.testing.assert_array_equal(y[0], sample_sequence_data[N_INPUT_HOURS:N_INPUT_HOURS + N_FORECAST_HOURS])
 
 
-def test_detect_and_remove_anomalies_replaces_spike(sample_hourly_df):
+def test_detect_and_remove_anomalies_replaces_impossible_spike(sample_hourly_df):
     df = sample_hourly_df.copy()
-    df.iloc[12, 0] = 99999.0  # extreme temporal spike
+    df.loc[df.index[12], "pm_25"] = 99999.0   # di luar batas fisik
     result = detect_and_remove_anomalies(df)
-    assert result.iloc[12, 0] < 99999.0
+    assert result.loc[df.index[12], "pm_25"] < 99999.0
 
 
 def test_detect_and_remove_anomalies_no_nans(sample_hourly_df):
     df = sample_hourly_df.copy()
-    df.iloc[5, 0] = 99999.0
+    df.loc[df.index[5], "pm_25"] = 99999.0
     result = detect_and_remove_anomalies(df)
     assert not result.isnull().any().any()
 
 
 def test_detect_and_remove_anomalies_preserves_normal(sample_hourly_df):
     result = detect_and_remove_anomalies(sample_hourly_df)
-    # no more than 10% of values should change significantly on normal data
+    # Data yang seluruhnya masuk akal secara fisik tidak boleh diubah sama sekali.
     changed = (~np.isclose(result.values, sample_hourly_df.values, atol=1e-6)).sum()
-    total = sample_hourly_df.size
-    assert changed / total < 0.1
+    assert changed == 0
+
+
+def test_detect_and_remove_anomalies_keeps_sustained_dust_event():
+    """Penyaring 3-sigma yang lama menghapus kejadian debu berjam-jam karena
+    kejadian nyata memang melewati ambang statistik. Batas fisik tidak boleh."""
+    n = 120
+    index = pd.date_range("2024-01-01", periods=n, freq="h")
+    df = pd.DataFrame({col: np.full(n, 30.0) for col in FEATURE_COLS}, index=index)
+    df["temp"] = 28.0
+    df["mmhg"] = 760.0
+    df["humidity"] = 82.0
+    df["noise"] = 55.0
+    df.loc[index[60:66], "tsp"] = 500.0        # 6 jam berdebu berat, nyata
+
+    result = detect_and_remove_anomalies(df)
+
+    assert result.loc[index[60:66], "tsp"].tolist() == [500.0] * 6
+
+
+def test_delta_round_trip_is_lossless():
+    from app.models.preprocessor import anchor_from_X, to_delta, from_delta
+    from app.config import N_FEATURES
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(7, N_INPUT_HOURS, N_FEATURES + 8))
+    y = rng.normal(size=(7, N_FORECAST_HOURS, N_FEATURES))
+    anchor = anchor_from_X(X)
+    np.testing.assert_allclose(from_delta(to_delta(y, anchor), anchor), y, atol=1e-12)
+
+
+def test_anchor_is_last_observed_sensor_row():
+    from app.models.preprocessor import anchor_from_X
+    from app.config import N_FEATURES
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(3, N_INPUT_HOURS, N_FEATURES + 8))
+    np.testing.assert_array_equal(anchor_from_X(X), X[:, -1, :N_FEATURES])
+
+
+def test_zero_delta_reproduces_persistence():
+    """Inti perbaikan: selisih nol HARUS menghasilkan tebakan naif 'nilai H+h =
+    nilai sekarang'. Itulah yang membuat persistence jadi perilaku bawaan model
+    dan mencegahnya kalah telak dari baseline seperti pada uji 1 Agu 2026."""
+    from app.models.preprocessor import anchor_from_X, from_delta
+    from app.config import N_FEATURES
+    rng = np.random.default_rng(2)
+    X = rng.normal(size=(5, N_INPUT_HOURS, N_FEATURES + 8))
+    anchor = anchor_from_X(X)
+    persistence = from_delta(np.zeros((5, N_FORECAST_HOURS, N_FEATURES)), anchor)
+    for step in range(N_FORECAST_HOURS):
+        np.testing.assert_array_equal(persistence[:, step, :], anchor)
