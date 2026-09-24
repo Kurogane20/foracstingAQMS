@@ -17,15 +17,39 @@ logger = logging.getLogger(__name__)
 
 M_PER_LAT = 111_000.0  # meters per degree latitude
 
-# Pasquill-Gifford (ay, az) dispersion coefficients by stability class
-_PG: dict[str, tuple[float, float]] = {
-    "A": (0.22, 0.20),
-    "B": (0.16, 0.12),
-    "C": (0.11, 0.08),
-    "D": (0.08, 0.06),
-    "E": (0.06, 0.03),
-    "F": (0.04, 0.016),
+# Koefisien dispersi Briggs (1973) untuk medan terbuka (rural), sebagaimana
+# ditabelkan Hanna, Briggs & Hosker (1982), Handbook on Atmospheric Diffusion.
+#
+#   σy = ay · x · (1 + 0,0001x)^-0,5                     semua kelas
+#   σz = az · x · (1 + bz·x)^pz                          lihat _BRIGGS_SZ
+#
+# Versi sebelumnya memakai σz = az·x linear untuk SEMUA kelas. Untuk kelas C–F
+# itu menyimpang dari Briggs: σz tumbuh terlalu cepat sehingga konsentrasi
+# permukaan jarak jauh diremehkan — pada kelas D di 5 km hingga ~2,8×, pada
+# kelas F ~1,8×. Arah galatnya tidak konservatif dan justru terjadi pada rezim
+# malam stabil yang terukur paling buruk di Berau.
+_BRIGGS_SY: dict[str, float] = {
+    "A": 0.22, "B": 0.16, "C": 0.11, "D": 0.08, "E": 0.06, "F": 0.04,
 }
+
+# (az, bz, pz):  σz = az · x · (1 + bz·x)^pz
+_BRIGGS_SZ: dict[str, tuple[float, float, float]] = {
+    "A": (0.20,  0.0,    0.0),
+    "B": (0.12,  0.0,    0.0),
+    "C": (0.08,  0.0002, -0.5),
+    "D": (0.06,  0.0015, -0.5),
+    "E": (0.03,  0.0003, -1.0),
+    "F": (0.016, 0.0003, -1.0),
+}
+
+
+def _briggs_sigma_y(stab: str, x: np.ndarray) -> np.ndarray:
+    return _BRIGGS_SY[stab] * x * (1.0 + 1e-4 * x) ** (-0.5)
+
+
+def _briggs_sigma_z(stab: str, x: np.ndarray) -> np.ndarray:
+    az, bz, pz = _BRIGGS_SZ[stab]
+    return az * x * (1.0 + bz * x) ** pz
 
 
 def _stability_class(
@@ -131,15 +155,14 @@ def _plume_conc(
     sigma0_y/z: initial dispersion of an AREA source (m) — prevents the
     point-source singularity from producing absurd near-field peaks.
     """
-    ay, az = _PG[stab]
     result = np.zeros(x_down.shape, dtype=np.float64)
     mask = x_down > 50.0
 
     xp = x_down[mask]
     yp = y_cross[mask]
 
-    sigma_y = np.sqrt((ay * xp * (1.0 + 1e-4 * xp) ** (-0.5)) ** 2 + sigma0_y ** 2)
-    sigma_z = np.sqrt((az * xp) ** 2 + sigma0_z ** 2)
+    sigma_y = np.sqrt(_briggs_sigma_y(stab, xp) ** 2 + sigma0_y ** 2)
+    sigma_z = np.sqrt(_briggs_sigma_z(stab, xp) ** 2 + sigma0_z ** 2)
 
     denom = math.pi * max(u, 0.5) * sigma_y * sigma_z + 1e-12
     result[mask] = (2.0 * Q / denom) * np.exp(-0.5 * (yp / (sigma_y + 1e-12)) ** 2)
