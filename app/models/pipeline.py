@@ -1,6 +1,11 @@
 import numpy as np
 import pandas as pd
 from app.config import FEATURE_COLS, N_FORECAST_HOURS, N_INPUT_HOURS
+
+# Sekuens yang dibuang di tiap batas (latih|validasi, kalibrasi|pelaporan) agar
+# jendela target tidak tumpang-tindih.
+PURGE_SEQUENCES = N_FORECAST_HOURS
+MIN_EVAL_SEQUENCES = 20
 from app.models.preprocessor import (
     preprocess_for_predict,
     preprocess_for_training,
@@ -8,6 +13,7 @@ from app.models.preprocessor import (
     anchor_from_X,
     to_delta,
     from_delta,
+    train_split_index,
 )
 from app.models.bilstm import predict_bilstm, train_bilstm
 from app.models.shrinkage import (
@@ -73,16 +79,33 @@ def run_prediction(uid: str) -> list:
 
 
 def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
-                 X: np.ndarray = None, y: np.ndarray = None) -> dict:
+                 X: np.ndarray = None, y: np.ndarray = None,
+                 base_times: pd.DatetimeIndex = None) -> dict:
     if X is None or y is None:
-        X, y = preprocess_for_training(uid)
+        X, y, base_times = preprocess_for_training(uid)
+    elif base_times is None or len(base_times) != len(X):
+        # Tanpa jam nyata, fitur kalender LightGBM terpaksa dikarang — itulah
+        # train/serve skew yang diperbaiki di sini. Lebih baik gagal jelas.
+        raise ValueError(
+            f"run_training({uid}): X/y dari luar wajib disertai base_times "
+            f"sepanjang X (jam input terakhir tiap sekuens)."
+        )
 
     if len(X) < 10:
         raise ValueError(f"Insufficient data for {uid}: only {len(X)} sequences")
 
-    split = int(len(X) * 0.9)
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
+    split = train_split_index(len(X))
+    # Jendela geser membuat target sekuens latih terakhir tumpang-tindih dengan
+    # target sekuens validasi pertama (N_FORECAST_HOURS baris). Buang sekuens di
+    # celah itu ("purging") agar validasi benar-benar tak pernah terlihat.
+    val_start = min(split + PURGE_SEQUENCES, len(X))
+    X_train, X_val = X[:split], X[val_start:]
+    y_train, y_val = y[:split], y[val_start:]
+    if len(X_val) < 2 * MIN_EVAL_SEQUENCES + PURGE_SEQUENCES:
+        raise ValueError(
+            f"Data validasi {uid} terlalu sedikit ({len(X_val)} sekuens) untuk "
+            f"memisahkan set kalibrasi α dari set pelaporan."
+        )
 
     # Latih pada selisih terhadap nilai terakhir teramati, bukan level absolut.
     anchor_train = anchor_from_X(X_train)
@@ -97,11 +120,9 @@ def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
         predict_bilstm(X_train[i : i + 1], uid)[0]
         for i in range(len(X_train))
     ])
-    base_times_train = [
-        pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i)
-        for i in range(len(X_train))
-    ]
-    train_lgbm(bilstm_preds_train, dy_train, base_times_train, uid,
+    # Jam nyata, bukan 2024-01-01 + i: produksi memberi LightGBM jam sungguhan,
+    # jadi fitur jam/hari/bulan saat latih harus berasal dari jam yang sama.
+    train_lgbm(bilstm_preds_train, dy_train, base_times[:split], uid,
                anchors=anchor_train, lgbm_params=lgbm_params)
 
     set_phase(uid, phase="evaluating", percent=95, eta_seconds=None)
@@ -110,30 +131,36 @@ def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
         for i in range(len(X_val))
     ])
     val_lgbm = np.array([
-        predict_lgbm(val_bilstm[i],
-                     pd.Timestamp("2024-01-01") + pd.Timedelta(hours=split + i),
-                     uid, anchor_val[i])["point"]
+        predict_lgbm(val_bilstm[i], base_times[val_start + i], uid, anchor_val[i])["point"]
         for i in range(len(X_val))
     ])
-    # Cari bobot penyusutan pada potongan validasi yang sama, lalu simpan.
     dy_val = to_delta(y_val, anchor_val)
-    alpha = fit_alpha(val_lgbm, dy_val)
+
+    # Validasi dibagi dua secara kronologis: paruh awal HANYA untuk mencari α,
+    # paruh akhir HANYA untuk melaporkan skor. Sebelumnya α dicari dan skor
+    # dilaporkan pada data yang sama, sehingga sebagian keunggulan yang terlihat
+    # adalah hasil penyetelan pada set itu sendiri (bias optimistis). Celah
+    # PURGE_SEQUENCES di antaranya mencegah target kedua paruh tumpang-tindih.
+    n_val = len(X_val)
+    cal_end = (n_val - PURGE_SEQUENCES) // 2
+    rep = slice(cal_end + PURGE_SEQUENCES, None)
+
+    alpha = fit_alpha(val_lgbm[:cal_end], dy_val[:cal_end])
     save_alpha(uid, alpha)
 
     # Dievaluasi pada level absolut agar mae_score tetap sebanding antar versi
-    # dan bisa dipakai deteksi drift; selisih akan tampak menipu bagusnya.
-    # Memakai selisih yang SUDAH disusutkan — inilah yang nanti dipakai produksi.
-    val_abs = from_delta(apply_alpha(val_lgbm, alpha), anchor_val)
-    mae = float(np.mean(np.abs(val_abs - y_val)))
+    # dan bisa dipakai deteksi drift. Memakai selisih yang SUDAH disusutkan —
+    # inilah yang nanti dipakai produksi — pada data yang tidak dipakai mencari α.
+    y_rep, a_rep, p_rep = y_val[rep], anchor_val[rep], val_lgbm[rep]
+    val_abs = from_delta(apply_alpha(p_rep, alpha), a_rep)
+    mae = float(np.mean(np.abs(val_abs - y_rep)))
 
-    # Baseline persistence pada potongan validasi yang sama. Tanpa ini tidak ada
-    # yang tahu apakah 0,08 itu bagus — dan uji 1 Agu 2026 menunjukkan model
-    # sebelumnya justru KALAH dari tebakan naif ini.
-    naive_abs = from_delta(np.zeros_like(val_lgbm), anchor_val)
-    mae_naive = float(np.mean(np.abs(naive_abs - y_val)))
+    # Baseline persistence pada potongan pelaporan yang sama.
+    naive_abs = from_delta(np.zeros_like(p_rep), a_rep)
+    mae_naive = float(np.mean(np.abs(naive_abs - y_rep)))
     skill = round(1.0 - mae / mae_naive, 4) if mae_naive > 0 else None
 
-    mae_raw = float(np.mean(np.abs(from_delta(val_lgbm, anchor_val) - y_val)))
+    mae_raw = float(np.mean(np.abs(from_delta(p_rep, a_rep) - y_rep)))
 
     return {
         "training_samples": len(X),
@@ -144,4 +171,7 @@ def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
         # 0 berarti model tidak menambahkan informasi apa pun di sensor ini.
         "mae_unshrunk":     round(mae_raw, 6),
         "alpha_mean":       round(float(alpha.mean()), 4),
+        # Ukuran tiap potongan, agar skor dapat ditafsirkan dengan benar.
+        "alpha_calibration_samples": cal_end,
+        "report_samples":            len(y_rep),
     }

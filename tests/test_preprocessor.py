@@ -139,3 +139,72 @@ def test_zero_delta_reproduces_persistence():
     persistence = from_delta(np.zeros((5, N_FORECAST_HOURS, N_FEATURES)), anchor)
     for step in range(N_FORECAST_HOURS):
         np.testing.assert_array_equal(persistence[:, step, :], anchor)
+
+
+def test_scaler_fit_rows_stops_at_last_training_row():
+    """Sekuens latih terakhir menyentuh baris split-1 + jendela - 1; scaler
+    tidak boleh melihat baris sesudahnya."""
+    from app.models.preprocessor import scaler_fit_rows, train_split_index
+    n_rows = 1000
+    window = N_INPUT_HOURS + N_FORECAST_HOURS
+    n_seq = n_rows - window + 1
+    split = train_split_index(n_seq)
+    assert scaler_fit_rows(n_rows) == split + window - 1
+    assert scaler_fit_rows(n_rows) < n_rows
+
+
+def test_scaler_does_not_see_validation_extremes(tmp_path, monkeypatch):
+    """Regresi kebocoran: sebelumnya scaler di-fit pada seluruh deret, sehingga
+    nilai ekstrem yang hanya muncul di porsi validasi ikut menentukan skala."""
+    import joblib
+    from app.models import preprocessor as pp
+    monkeypatch.setattr(pp, "MODELS_DIR", str(tmp_path))
+
+    n = 600
+    idx = pd.date_range("2024-01-01", periods=n, freq="h")
+    df = pd.DataFrame({c: np.full(n, 40.0) for c in FEATURE_COLS}, index=idx)
+    df["temp"], df["mmhg"], df["humidity"], df["noise"] = 28.0, 760.0, 82.0, 55.0
+    df.loc[idx[-5], "tsp"] = 900.0              # ekstrem HANYA di ujung validasi
+
+    fit_end = pp.scaler_fit_rows(n)
+    pp.normalize(df.iloc[:fit_end], "uid_x", fit=True)
+    scaler = joblib.load(tmp_path / "uid_x" / "scaler.pkl")["scaler"]
+
+    tsp_i = FEATURE_COLS.index("tsp")
+    assert scaler.data_max_[tsp_i] < np.log1p(900.0)   # ekstrem validasi tak terlihat
+
+
+def test_sequence_base_times_is_last_observed_hour():
+    """Jam dasar tiap sekuens = jam input terakhir — persis `last_time` di jalur
+    prediksi. Sebelumnya LightGBM dilatih dengan jam sintetis 2024-01-01 + i,
+    sehingga fitur jam/hari/bulannya bergeser dari yang dilihat saat produksi."""
+    from app.models.preprocessor import sequence_base_times
+    n = 100
+    index = pd.date_range("2025-10-03 07:00", periods=n, freq="h")
+    data = np.arange(n, dtype=float)[:, np.newaxis]    # nilai = posisi baris
+    X, _ = create_sequences(data, N_INPUT_HOURS, N_FORECAST_HOURS)
+    base_times = sequence_base_times(index)
+    assert len(base_times) == len(X)
+    for i in (0, 17, len(X) - 1):
+        assert base_times[i] == index[int(X[i, -1, 0])]
+
+
+def test_preprocess_for_training_returns_real_base_times(tmp_path, monkeypatch):
+    import app.db
+    from app.models import preprocessor as pp
+    monkeypatch.setattr(pp, "MODELS_DIR", str(tmp_path))
+    n = 120
+    idx = pd.date_range("2025-10-03 07:00", periods=n, freq="h")
+    df = pd.DataFrame({c: np.full(n, 40.0) for c in FEATURE_COLS}, index=idx)
+    df["temp"], df["mmhg"], df["humidity"], df["noise"] = 28.0, 760.0, 82.0, 55.0
+    # Bentuk baris mentah t_loggers: stempel waktu unix sebagai kolom.
+    df["datetime_unix"] = (idx - pd.Timestamp("1970-01-01")) // pd.Timedelta("1s")
+    df = df.reset_index(drop=True)
+    monkeypatch.setattr(pp, "fetch_sensor_data", lambda uid, hours: df)
+    monkeypatch.setattr(app.db, "get_sensor_lat_lng", lambda uid: None)
+
+    X, y, base_times = pp.preprocess_for_training("uid_x")
+
+    assert len(base_times) == len(X) == len(y)
+    assert base_times[0] == idx[N_INPUT_HOURS - 1]
+    assert base_times[-1] == idx[n - N_FORECAST_HOURS - 1]

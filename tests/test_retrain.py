@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 from unittest.mock import patch, MagicMock, call
 
@@ -13,6 +14,7 @@ _BEST_PARAMS = {"bilstm": _BILSTM_PARAMS, "lgbm": _LGBM_PARAMS}
 
 _MOCK_X = np.random.randn(20, 24, 14)
 _MOCK_Y = np.random.randn(20, 6, 14)
+_MOCK_TIMES = pd.date_range("2025-10-03 07:00", periods=20, freq="h")
 
 
 def _make_bilstm_pred():
@@ -111,7 +113,7 @@ def test_retrain_sensor_runs_tuning_when_no_params_and_flag_set():
     bilstm_pred = np.random.randn(6, 14)
 
     with patch("app.services.retrain.load_best_params", return_value=None), \
-         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y)) as mock_pre, \
+         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y, _MOCK_TIMES)) as mock_pre, \
          patch("app.services.retrain.tune_bilstm", return_value=_BILSTM_PARAMS) as mock_tune_b, \
          patch("app.services.retrain.train_bilstm") as mock_train_bilstm, \
          patch("app.services.retrain.predict_bilstm", return_value=np.random.randn(1, 6, 14)) as mock_pred_bilstm, \
@@ -134,6 +136,7 @@ def test_retrain_sensor_runs_tuning_when_no_params_and_flag_set():
         lgbm_params=_LGBM_PARAMS,
         X=_MOCK_X,
         y=_MOCK_Y,
+        base_times=_MOCK_TIMES,
     )
     assert result["status"] == "ready"
 
@@ -153,7 +156,7 @@ def test_retrain_sensor_tuning_evicts_model_cache():
         return np.random.randn(1, 6, 14)
 
     with patch("app.services.retrain.load_best_params", return_value=None), \
-         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y)), \
+         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y, _MOCK_TIMES)), \
          patch("app.services.retrain.tune_bilstm", return_value=_BILSTM_PARAMS), \
          patch("app.services.retrain.train_bilstm", side_effect=fake_train_bilstm), \
          patch("app.services.retrain.predict_bilstm", side_effect=fake_predict_bilstm), \
@@ -184,7 +187,7 @@ def test_status_transitions_with_tuning():
             status_calls.append(status)
 
     with patch("app.services.retrain.load_best_params", return_value=None), \
-         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y)), \
+         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y, _MOCK_TIMES)), \
          patch("app.services.retrain.tune_bilstm", return_value=_BILSTM_PARAMS), \
          patch("app.services.retrain.train_bilstm"), \
          patch("app.services.retrain.predict_bilstm", return_value=np.random.randn(1, 6, 14)), \

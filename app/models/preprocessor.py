@@ -10,6 +10,7 @@ from app.config import (
     N_FEATURES, N_INPUT_HOURS, N_FORECAST_HOURS,
     TRAIN_HISTORY_HOURS, MODELS_DIR,
     PHYSICAL_LIMITS, LOG_SCALE_COLS, FEATURE_SCHEMA_VERSION,
+    VAL_FRACTION,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,13 @@ def create_sequences(data: np.ndarray, n_in: int, n_out: int,
     return np.array(X), np.array(y)
 
 
+def sequence_base_times(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Jam input terakhir tiap sekuens hasil create_sequences — padanan persis
+    `last_time` di jalur prediksi. LightGBM menurunkan fitur kalendernya dari
+    sini, jadi saat latih dan saat produksi ia harus menerima jam yang sama."""
+    return index[N_INPUT_HOURS - 1 : len(index) - N_FORECAST_HOURS]
+
+
 def preprocess_for_predict(uid: str) -> tuple:
     df_raw    = fetch_sensor_data(uid, hours=N_INPUT_HOURS * 3)
     df_hourly = resample_hourly(df_raw)
@@ -243,13 +251,41 @@ def preprocess_for_predict(uid: str) -> tuple:
     return X, df_norm.index[-N_INPUT_HOURS:]
 
 
+def train_split_index(n_sequences: int) -> int:
+    """Indeks sekuens pertama yang masuk validasi (pembagian kronologis)."""
+    return int(n_sequences * (1.0 - VAL_FRACTION))
+
+
+def scaler_fit_rows(n_rows: int) -> int:
+    """Jumlah baris awal yang boleh dilihat scaler saat di-fit.
+
+    Sekuens latih ke-i memakai baris [i, i + N_INPUT + N_FORECAST). Sekuens latih
+    terakhir berindeks split-1, jadi baris terjauh yang disentuh data latih adalah
+    split - 1 + N_INPUT + N_FORECAST - 1. Scaler tidak boleh melihat lebih jauh
+    dari itu — kalau tidak, rentang min–maks data validasi ikut bocor ke
+    transformasi dan skor evaluasi menjadi optimistis.
+    """
+    window = N_INPUT_HOURS + N_FORECAST_HOURS
+    n_seq = max(n_rows - window + 1, 0)
+    if n_seq == 0:
+        return n_rows
+    return min(train_split_index(n_seq) + window - 1, n_rows)
+
+
 def preprocess_for_training(uid: str) -> tuple:
     df_raw    = fetch_sensor_data(uid, hours=TRAIN_HISTORY_HOURS + 2)
     df_hourly = resample_hourly(df_raw)
     df_clean  = detect_and_remove_anomalies(df_hourly)
     df_clean  = clean(df_clean)
     df_timed  = add_time_features(df_clean)
-    df_norm, _ = normalize(df_timed, uid, fit=True)
+    # Fit scaler HANYA pada baris yang disentuh sekuens latih, lalu transform
+    # seluruh deret dengan scaler itu. Sebelumnya scaler di-fit pada seluruh
+    # deret termasuk porsi validasi — kebocoran informasi yang membuat skor
+    # validasi sedikit optimistis. Nilai validasi di luar rentang latih boleh
+    # melewati [0, 1]; itu perilaku yang benar, bukan galat.
+    fit_end = scaler_fit_rows(len(df_timed))
+    normalize(df_timed.iloc[:fit_end], uid, fit=True)
+    df_norm, _ = normalize(df_timed, uid, fit=False)
     # Append meteo features (fetched per-uid lat/lng stored at retrain time)
     from app.db import get_sensor_lat_lng
     from app.services.meteo import fetch_meteo_training
@@ -267,5 +303,6 @@ def preprocess_for_training(uid: str) -> tuple:
         logger.warning(f"[{uid}] No lat/lng stored; meteo features set to neutral")
         for col in METEO_COLS:
             df_norm[col] = 0.0
-    return create_sequences(df_norm.values, N_INPUT_HOURS, N_FORECAST_HOURS,
+    X, y = create_sequences(df_norm.values, N_INPUT_HOURS, N_FORECAST_HOURS,
                             n_target_cols=N_FEATURES)
+    return X, y, sequence_base_times(df_norm.index)

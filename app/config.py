@@ -105,6 +105,11 @@ LOG_SCALE_COLS = [
 ]
 N_INPUT_HOURS   = 24
 N_FORECAST_HOURS = 6
+
+# Porsi akhir deret (kronologis) yang TIDAK dilatihkan. Dipakai bersama oleh
+# pra-pemrosesan (batas fit scaler) dan pipeline (pembagian latih/validasi),
+# supaya keduanya tidak pernah bergeser satu sama lain.
+VAL_FRACTION = 0.10
 SSA_WINDOW       = 12
 BILSTM_UNITS     = 128
 TRAIN_HISTORY_HOURS = 24 * 365   # 1 tahun

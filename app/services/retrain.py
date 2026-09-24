@@ -1,10 +1,11 @@
 import logging
 import numpy as np
-import pandas as pd
 from datetime import datetime, timezone
 from app.db import upsert_metadata
 from app.models.pipeline import run_training
-from app.models.preprocessor import preprocess_for_training, anchor_from_X, to_delta
+from app.models.preprocessor import (
+    preprocess_for_training, anchor_from_X, to_delta, train_split_index,
+)
 from app.models.tuning import load_best_params, tune_bilstm, tune_lgbm, save_best_params
 from app.models.bilstm import predict_bilstm, train_bilstm, _model_cache
 from app.training_progress import set_phase, clear_progress
@@ -27,7 +28,7 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
             upsert_metadata(uid, status="tuning")
             logger.info(f"[{uid}] Starting tuning pass")
 
-            X, y = preprocess_for_training(uid)
+            X, y, base_times = preprocess_for_training(uid)
 
             # Jalur tuning harus memakai ruang target yang SAMA dengan jalur
             # pelatihan (selisih terhadap nilai terakhir), kalau tidak parameter
@@ -36,7 +37,7 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
 
             bilstm_params = tune_bilstm(X, dy, uid)
 
-            split = int(len(X) * 0.9)
+            split = train_split_index(len(X))
             X_train = X[:split]
             dy_train = dy[:split]
             anchor_train = anchor_from_X(X_train)
@@ -46,19 +47,15 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
                 predict_bilstm(X_train[i:i + 1], uid)[0]
                 for i in range(len(X_train))
             ])
-            base_times = [
-                pd.Timestamp("2024-01-01") + pd.Timedelta(hours=i)
-                for i in range(len(X_train))
-            ]
-
-            lgbm_params = tune_lgbm(bilstm_preds, dy_train, base_times, uid,
+            lgbm_params = tune_lgbm(bilstm_preds, dy_train, base_times[:split], uid,
                                     anchors=anchor_train)
             save_best_params(uid, bilstm_params, lgbm_params)
             logger.info(f"[{uid}] Tuning complete, params saved")
 
         upsert_metadata(uid, status="training")
         if run_tuning and params is None:
-            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params, X=X, y=y)
+            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params,
+                                  X=X, y=y, base_times=base_times)
         else:
             result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params)
         trained_at = datetime.now(timezone.utc).replace(tzinfo=None)
