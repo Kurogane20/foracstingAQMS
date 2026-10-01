@@ -141,6 +141,30 @@ def test_retrain_sensor_runs_tuning_when_no_params_and_flag_set():
     assert result["status"] == "ready"
 
 
+def test_retrain_sensor_tuning_never_sees_validation_portion():
+    """Potongan validasi run_training dipakai mencari α dan MELAPORKAN skor; bila
+    ikut memilih hiperparameter BiLSTM, skornya jadi optimistis."""
+    from app.models.preprocessor import train_split_index
+
+    with patch("app.services.retrain.load_best_params", return_value=None), \
+         patch("app.services.retrain.preprocess_for_training", return_value=(_MOCK_X, _MOCK_Y, _MOCK_TIMES)), \
+         patch("app.services.retrain.tune_bilstm", return_value=_BILSTM_PARAMS) as mock_tune_b, \
+         patch("app.services.retrain.train_bilstm"), \
+         patch("app.services.retrain.predict_bilstm", return_value=np.random.randn(1, 6, 14)), \
+         patch("app.services.retrain.tune_lgbm", return_value=_LGBM_PARAMS) as mock_tune_l, \
+         patch("app.services.retrain.save_best_params"), \
+         patch("app.services.retrain.run_training", return_value=_MOCK_RESULT), \
+         patch("app.services.retrain.upsert_metadata"):
+        from app.services.retrain import retrain_sensor
+        retrain_sensor(UID, run_tuning=True)
+
+    split = train_split_index(len(_MOCK_X))
+    X_tuned, dy_tuned = mock_tune_b.call_args[0][:2]
+    np.testing.assert_array_equal(X_tuned, _MOCK_X[:split])
+    assert len(dy_tuned) == split
+    assert len(mock_tune_l.call_args[0][0]) == split
+
+
 def test_retrain_sensor_tuning_evicts_model_cache():
     """After intermediate train_bilstm, _model_cache entry is evicted before predict_bilstm."""
     eviction_order = []

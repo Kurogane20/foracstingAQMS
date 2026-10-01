@@ -17,3 +17,38 @@ def test_bilstm_output_shape():
 def test_bilstm_model_has_correct_input_shape():
     model = build_bilstm()
     assert model.input_shape == (None, N_INPUT_HOURS, N_SSA_FEATURES)
+
+
+def test_model_cache_reloads_after_retrain(tmp_path, monkeypatch):
+    """Regresi: cache dulu menyimpan model per uid tanpa syarat, sehingga setelah
+    retrain LightGBM, α, MAE — dan produksi — tetap memakai BiLSTM lama."""
+    import os
+    from unittest.mock import patch
+    from app.models import bilstm
+
+    monkeypatch.setattr(bilstm, "MODELS_DIR", str(tmp_path))
+    monkeypatch.setattr(bilstm, "_model_cache", {})
+    path = tmp_path / "uid_c" / "bilstm.keras"
+    path.parent.mkdir()
+    path.write_bytes(b"lama")
+
+    loaded = []
+    with patch.object(bilstm.tf.keras.models, "load_model",
+                      side_effect=lambda p: loaded.append(object()) or loaded[-1]):
+        first = bilstm._load_model("uid_c")
+        assert bilstm._load_model("uid_c") is first          # berkas sama → cache
+        path.write_bytes(b"model-baru")                       # retrain menulis ulang
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        second = bilstm._load_model("uid_c")
+
+    assert second is not first
+    assert len(loaded) == 2
+
+
+def test_missing_model_raises_file_not_found(tmp_path, monkeypatch):
+    """predict_sensor menerjemahkan FileNotFoundError menjadi 'belum dilatih'."""
+    from app.models import bilstm
+    monkeypatch.setattr(bilstm, "MODELS_DIR", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        bilstm._load_model("tidak_ada")

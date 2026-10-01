@@ -30,6 +30,26 @@ def build_lgbm_features(
 # 14 selisih BiLSTM + 14 jangkar + 3 kalender
 N_LGBM_FEATURES = N_FEATURES * 2 + 3
 
+LGBM_BASE_PARAMS = dict(
+    n_estimators=400, learning_rate=0.03, num_leaves=63,
+    min_child_samples=10, subsample=0.8, colsample_bytree=0.8, verbose=-1,
+)
+
+
+def build_lgbm_dataset(
+    bilstm_preds: np.ndarray,
+    y_true: np.ndarray,
+    base_times: list,
+    anchors: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Satu baris per (sekuens, horizon): X (N·6, N_LGBM_FEATURES), y (N·6, 14)."""
+    X_all = np.vstack([
+        build_lgbm_features(bilstm_preds[i], bt, anchors[i])
+        for i, bt in enumerate(base_times)
+    ])
+    y_all = np.vstack([y_true[i] for i in range(len(base_times))])
+    return X_all, y_all
+
 
 def train_lgbm(
     bilstm_preds: np.ndarray,
@@ -39,18 +59,9 @@ def train_lgbm(
     anchors: np.ndarray,
     lgbm_params: dict = None,
 ) -> None:
-    X_all, y_all = [], []
-    for i, bt in enumerate(base_times):
-        feats = build_lgbm_features(bilstm_preds[i], bt, anchors[i])
-        X_all.append(feats)
-        y_all.append(y_true[i])
-    X_all = np.vstack(X_all)
-    y_all = np.vstack(y_all)
+    X_all, y_all = build_lgbm_dataset(bilstm_preds, y_true, base_times, anchors)
 
-    base = dict(
-        n_estimators=400, learning_rate=0.03, num_leaves=63,
-        min_child_samples=10, subsample=0.8, colsample_bytree=0.8, verbose=-1,
-    )
+    base = dict(LGBM_BASE_PARAMS)
     if lgbm_params:
         base.update(lgbm_params)
 

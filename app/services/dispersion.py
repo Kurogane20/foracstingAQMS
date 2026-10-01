@@ -169,13 +169,31 @@ def _plume_conc(
     return result
 
 
+def _hourly_unix(data: dict) -> list[int]:
+    """Stempel `hourly.time` Open-Meteo → unix detik (UTC).
+
+    Dengan timezone=auto, waktunya jam dinding LOKAL tanpa offset, dan deretnya
+    selalu dimulai pukul 00:00 lokal hari pertama — bukan jam sekarang. Baris
+    harus dipilih berdasarkan waktu, tidak pernah berdasarkan posisi indeks.
+    """
+    offset = int(data.get("utc_offset_seconds") or 0)
+    return [
+        int(datetime.fromisoformat(t).replace(tzinfo=timezone.utc).timestamp()) - offset
+        for t in data.get("hourly", {}).get("time", [])
+    ]
+
+
 async def _fetch_wind_forecast(
-    lat: float, lng: float, hours: int, client: httpx.AsyncClient
+    lat: float, lng: float, hours: int, client: httpx.AsyncClient,
+    start_unix: int | None = None,
 ) -> list[dict]:
     """
-    Fetch hourly wind forecast for hour indices 0..hours from Open-Meteo.
+    Fetch hourly wind forecast for the hours start..start+hours from Open-Meteo,
+    where start is the hour beginning at `start_unix` (default: current UTC hour).
     Returns list of {speed, direction, cloudcover, hour, label_time} dicts.
     """
+    if start_unix is None:
+        start_unix = int(datetime.now(timezone.utc).timestamp()) // 3600 * 3600
     resp = await client.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -184,20 +202,29 @@ async def _fetch_wind_forecast(
             "hourly":          "wind_speed_10m,wind_direction_10m,cloudcover,precipitation",
             "wind_speed_unit": "ms",
             "timezone":        "auto",
-            "forecast_days":   1,
+            # Dua hari: jendela jam-sekarang..+6 bisa melewati tengah malam lokal.
+            "forecast_days":   2,
         },
         timeout=10.0,
     )
     resp.raise_for_status()
-    hourly = resp.json().get("hourly", {})
+    data   = resp.json()
+    hourly = data.get("hourly", {})
     times  = hourly.get("time", [])
     speeds = hourly.get("wind_speed_10m", [])
     dirs   = hourly.get("wind_direction_10m", [])
     clouds = hourly.get("cloudcover", [])
     precip = hourly.get("precipitation", [])
 
+    # Sebelumnya indeks 0..hours diambil apa adanya, sehingga setiap prakiraan
+    # memakai angin pukul 00:00–06:00 lokal berapa pun jam pemanggilannya.
+    unix = _hourly_unix(data)
+    start = next((i for i, u in enumerate(unix) if u >= start_unix), None)
+    if start is None or unix[start] - start_unix >= 3600:
+        return []   # respons tidak memuat jam sekarang → pemanggil pakai cadangan netral
+
     result = []
-    for i in range(min(hours + 1, len(times))):
+    for i in range(start, min(start + hours + 1, len(times))):
         t = times[i]                                     # e.g. "2024-01-15T14:00"
         local_hour = int(t[11:13]) if len(t) >= 13 else 12
         label_time = t[11:16]      if len(t) >= 16 else "00:00"
@@ -312,10 +339,16 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
     if not sensors:
         return {"frames": []}
 
+    # Frame h berlaku untuk jam forecast_at + h — jam yang sama yang dicatat di
+    # validasi silang, jadi angin diambil persis untuk jam-jam itu.
+    forecast_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start_unix = int(forecast_at.timestamp())
+
     # Fetch hourly forecast for all sensors in parallel
     async with httpx.AsyncClient() as client:
         fetch_results = await asyncio.gather(
-            *[_fetch_wind_forecast(s["lat"], s["lng"], hours, client) for s in sensors],
+            *[_fetch_wind_forecast(s["lat"], s["lng"], hours, client, start_unix)
+              for s in sensors],
             return_exceptions=True,
         )
 
@@ -345,7 +378,6 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
 
     frames = []
     validation_rows: list[dict] = []
-    forecast_at = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
     for h in range(hours + 1):
         total = np.zeros(lat_grid.shape, dtype=np.float64)
@@ -494,7 +526,8 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
             for r, c in zip(rows, cols)
         ]
 
-        raw_time = hourly_per_sensor[0][h].get("label_time")
+        hw0 = hourly_per_sensor[0]
+        raw_time = hw0[h].get("label_time") if h < len(hw0) else None
         label_time = raw_time if raw_time is not None else datetime.now(timezone.utc).strftime("%H:%M")
         label = f"Sekarang {label_time}" if h == 0 else f"H+{h} {label_time}"
 
@@ -527,8 +560,14 @@ async def compute_dispersion_forecast(sensors: list[dict], hours: int = 6) -> di
     }
 
 
-async def _fetch_wind_past24(lat: float, lng: float, client: httpx.AsyncClient) -> list[dict]:
-    """Past-24-hour hourly wind/cloud/precip from Open-Meteo (past_days=1)."""
+async def _fetch_wind_past24(
+    lat: float, lng: float, client: httpx.AsyncClient, end_unix: int | None = None,
+) -> list[dict]:
+    """Hourly wind/cloud/precip for the 24 hours ending at the hour beginning
+    `end_unix` (default: current UTC hour), oldest first. Entry k belongs to
+    hour end_unix - (23 - k)·3600. Empty list if the response lacks that window."""
+    if end_unix is None:
+        end_unix = int(datetime.now(timezone.utc).timestamp()) // 3600 * 3600
     resp = await client.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -543,17 +582,24 @@ async def _fetch_wind_past24(lat: float, lng: float, client: httpx.AsyncClient) 
         timeout=10.0,
     )
     resp.raise_for_status()
-    hourly = resp.json().get("hourly", {})
+    data   = resp.json()
+    hourly = data.get("hourly", {})
     times  = hourly.get("time", [])
     speeds = hourly.get("wind_speed_10m", [])
     dirs   = hourly.get("wind_direction_10m", [])
     clouds = hourly.get("cloudcover", [])
     precip = hourly.get("precipitation", [])
 
-    # Keep only hours that have already passed (past_days includes future too)
-    now_utc_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    # Pilih berdasarkan waktu, bukan posisi. Versi sebelumnya memotong deret
+    # memakai jam UTC padahal stempelnya jam lokal WITA, sehingga jendela "24 jam
+    # terakhir" tertinggal 8 jam dari TSP yang dipasangkan dengannya (dan dekat
+    # tengah malam lokal justru mengambil jam-jam prakiraan di masa depan).
+    unix = _hourly_unix(data)
+    window_start = end_unix - 23 * 3600
     rows = []
     for i, t in enumerate(times):
+        if not window_start <= unix[i] <= end_unix:
+            continue
         rows.append({
             "time":       t,
             "speed":      max(float(speeds[i]) if speeds[i] is not None else 0.5, 0.5),
@@ -562,14 +608,9 @@ async def _fetch_wind_past24(lat: float, lng: float, client: httpx.AsyncClient) 
             "precip":     float(precip[i] or 0.0) if i < len(precip) else 0.0,
             "hour":       int(t[11:13]) if len(t) >= 13 else 12,
         })
-    # Times are local; the array is chronological — the past 24 h are simply the
-    # 24 entries ending at "now" position. past_days=1 → first 24 entries are
-    # yesterday; entries beyond local-now are forecast. Use a conservative cut:
-    # drop the trailing forecast hours by keeping the first 24 + hours elapsed
-    # today, then take the last 24.
-    elapsed_today = now_utc_hour.hour + 1  # coarse; local offset differences are tolerable here
-    usable = rows[: min(len(rows), 24 + elapsed_today)]
-    return usable[-24:] if len(usable) >= 24 else usable
+    # Pemanggil mengindeks per posisi (entri k ↔ jam ke-k jendela); deret yang
+    # bolong akan menggeser semua pasangan angin–TSP, jadi lebih baik ditolak.
+    return rows if len(rows) == 24 else []
 
 
 async def compute_dispersion_daily(sensors: list[dict]) -> dict:
@@ -585,9 +626,12 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
         return {"grid": [], "wind_vectors": [], "max_conc": 0.0,
                 "period": None, "updated_at": datetime.now(timezone.utc).isoformat()}
 
+    # Jam terakhir jendela; angin dan TSP harus dipasangkan pada jam yang sama.
+    now_hour = int(datetime.now(timezone.utc).timestamp() // 3600 * 3600)
+
     async with httpx.AsyncClient() as client:
         wind_results = await asyncio.gather(
-            *[_fetch_wind_past24(s["lat"], s["lng"], client) for s in sensors],
+            *[_fetch_wind_past24(s["lat"], s["lng"], client, now_hour) for s in sensors],
             return_exceptions=True,
         )
     wind_per_sensor = [
@@ -616,7 +660,6 @@ async def compute_dispersion_daily(sensors: list[dict]) -> dict:
     except Exception:
         emission_sources = []
 
-    now_hour = int(datetime.now(timezone.utc).timestamp() // 3600 * 3600)
     total_sum = np.zeros(lat_grid.shape, dtype=np.float64)
     n_hours = 0
 

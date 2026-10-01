@@ -35,12 +35,16 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
             # yang ditemukan dioptimalkan untuk masalah yang berbeda.
             dy = to_delta(y, anchor_from_X(X))
 
-            bilstm_params = tune_bilstm(X, dy, uid)
-
+            # Tuning hanya boleh melihat porsi latih. Sebelumnya tune_bilstm
+            # menerima seluruh deret, sehingga potongan yang nanti dipakai
+            # run_training untuk mencari α dan MELAPORKAN skor ikut memilih
+            # hiperparameter — skornya jadi optimistis.
             split = train_split_index(len(X))
             X_train = X[:split]
             dy_train = dy[:split]
             anchor_train = anchor_from_X(X_train)
+
+            bilstm_params = tune_bilstm(X_train, dy_train, uid)
             train_bilstm(X_train, dy_train, uid, **bilstm_params)
             _model_cache.pop(uid, None)   # force reload of just-saved model
             bilstm_preds = np.array([

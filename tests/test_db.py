@@ -267,3 +267,18 @@ def test_get_prediction_history_empty_returns_list():
     with patch("app.db.mysql.connector.connect", return_value=conn_mock):
         result = get_prediction_history("uid_001", days=7)
     assert result == []
+
+
+def test_get_unresolved_predictions_waits_for_full_target_hour():
+    """Aktual = rata-rata [t, t+1 jam). Dulu `target_time <= NOW()` membuat
+    rata-rata beberapa menit pertama tercatat permanen sebagai aktual."""
+    from app.db import get_unresolved_predictions
+    cursor_mock = MagicMock()
+    cursor_mock.fetchall.return_value = []
+    conn_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        get_unresolved_predictions("s1")
+    sql = cursor_mock.execute.call_args[0][0]
+    assert "UTC_TIMESTAMP() - INTERVAL 1 HOUR" in sql
+    assert "NOW()" not in sql

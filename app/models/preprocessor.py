@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 import numpy as np
 import pandas as pd
 import joblib
@@ -20,7 +21,10 @@ def fetch_sensor_data(uid: str, hours: int = N_INPUT_HOURS) -> pd.DataFrame:
     conn = None
     try:
         conn = mysql.connector.connect(**SENSOR_DB_CONFIG)
-        cutoff_unix = int(pd.Timestamp.now().timestamp()) - hours * 3600
+        # time.time() selalu UTC. pd.Timestamp.now() naif berisi jam dinding lokal
+        # server, dan .timestamp() menafsirkannya sebagai UTC — di server WITA
+        # jendelanya bergeser 8 jam.
+        cutoff_unix = int(time.time()) - hours * 3600
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -46,6 +50,19 @@ def resample_hourly(df: pd.DataFrame) -> pd.DataFrame:
     df["timestamp"] = pd.to_datetime(df["datetime_unix"], unit="s")
     df = df.set_index("timestamp")
     return df[FEATURE_COLS].resample("h").mean()
+
+
+def drop_incomplete_hour(df: pd.DataFrame, now: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Buang bin jam yang belum selesai (indeks naif UTC, label = awal jam).
+
+    Bin jam berjalan hanya berisi bacaan beberapa menit pertama. Bila ikut masuk,
+    ia menjadi baris input terakhir — yaitu JANGKAR yang selisihnya diramal model
+    — padahal saat latih setiap jangkar adalah rata-rata satu jam penuh.
+    """
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is not None:
+        now = now.tz_convert("UTC").tz_localize(None)
+    return df[df.index < now.floor("h")]
 
 
 def detect_and_remove_anomalies(df: pd.DataFrame) -> pd.DataFrame:
@@ -222,7 +239,9 @@ def sequence_base_times(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 def preprocess_for_predict(uid: str) -> tuple:
     df_raw    = fetch_sensor_data(uid, hours=N_INPUT_HOURS * 3)
-    df_hourly = resample_hourly(df_raw)
+    # Langkah 1 prakiraan kini jam yang sedang berjalan — jam pertama yang belum
+    # teramati penuh.
+    df_hourly = drop_incomplete_hour(resample_hourly(df_raw))
     if len(df_hourly) < N_INPUT_HOURS:
         raise ValueError(
             f"Insufficient hourly data for uid={uid}: got {len(df_hourly)} rows, need {N_INPUT_HOURS}"

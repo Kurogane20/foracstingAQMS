@@ -179,6 +179,13 @@ def save_predictions(uid: str, predicted_at: datetime, predictions: list[dict]) 
 
 
 def get_unresolved_predictions(uid: str) -> list[dict]:
+    """Prediksi yang jam targetnya SUDAH SELESAI dan belum punya nilai aktual.
+
+    `target_time` adalah awal jam (UTC naif); aktualnya rata-rata [t, t+1 jam).
+    Dulu syaratnya `target_time <= NOW()`: begitu ada 10 bacaan, rata-rata dari
+    beberapa menit pertama tercatat permanen sebagai "aktual satu jam". NOW()
+    juga mengikuti zona waktu sesi MySQL, padahal kolomnya UTC.
+    """
     conn = mysql.connector.connect(**RESULT_DB_CONFIG)
     try:
         cursor = conn.cursor(dictionary=True)
@@ -186,7 +193,9 @@ def get_unresolved_predictions(uid: str) -> list[dict]:
             """
             SELECT uid, target_time, step, predicted_at
             FROM predictions
-            WHERE uid = %s AND target_time <= NOW() AND actual_values IS NULL
+            WHERE uid = %s
+              AND target_time <= UTC_TIMESTAMP() - INTERVAL 1 HOUR
+              AND actual_values IS NULL
             ORDER BY target_time ASC
             """,
             (uid,),

@@ -208,3 +208,25 @@ def test_preprocess_for_training_returns_real_base_times(tmp_path, monkeypatch):
     assert len(base_times) == len(X) == len(y)
     assert base_times[0] == idx[N_INPUT_HOURS - 1]
     assert base_times[-1] == idx[n - N_FORECAST_HOURS - 1]
+
+
+def test_drop_incomplete_hour_removes_running_hour():
+    """Bin jam berjalan hanya berisi beberapa menit; bila tersisa ia menjadi
+    jangkar prediksi, padahal saat latih jangkar selalu rata-rata jam penuh."""
+    from app.models.preprocessor import drop_incomplete_hour
+    idx = pd.date_range("2026-10-01 08:00", periods=4, freq="h")      # 08..11 UTC
+    df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0, 4.0]}, index=idx)
+
+    out = drop_incomplete_hour(df, now=pd.Timestamp("2026-10-01 11:20"))
+    assert out.index[-1] == pd.Timestamp("2026-10-01 10:00")
+
+    out = drop_incomplete_hour(df, now=pd.Timestamp("2026-10-01 12:00"))
+    assert out.index[-1] == pd.Timestamp("2026-10-01 11:00")
+
+
+def test_drop_incomplete_hour_converts_aware_now_to_utc():
+    from app.models.preprocessor import drop_incomplete_hour
+    idx = pd.date_range("2026-10-01 08:00", periods=4, freq="h")
+    df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0, 4.0]}, index=idx)
+    now_wita = pd.Timestamp("2026-10-01 19:20", tz="Asia/Makassar")   # = 11:20 UTC
+    assert drop_incomplete_hour(df, now=now_wita).index[-1] == pd.Timestamp("2026-10-01 10:00")

@@ -15,7 +15,12 @@ from app.training_progress import set_phase
 # SSA doubles sensor features; time + meteo features pass through raw (no SSA)
 N_SSA_FEATURES = N_FEATURES * 2 + N_TIME_FEATURES + N_METEO_FEATURES  # 28 + 4 + 6 = 38
 
-_model_cache: dict[str, tf.keras.Model] = {}
+# uid → (sidik berkas, model). Sidiknya (mtime_ns, ukuran) bilstm.keras: cache
+# tanpa sidik terus menyajikan model LAMA setelah retrain — LightGBM, α, dan MAE
+# lalu dihitung dari BiLSTM lama, dan produksi baru berganti model saat restart.
+# Memeriksa berkas (bukan sekadar mengosongkan cache saat melatih) juga menangani
+# worker uvicorn lain yang tidak ikut melatih.
+_model_cache: dict[str, tuple[tuple[int, int], tf.keras.Model]] = {}
 
 
 class _ProgressCallback(tf.keras.callbacks.Callback):
@@ -111,11 +116,18 @@ def train_bilstm(
     return model
 
 
+def _load_model(uid: str) -> tf.keras.Model:
+    model_path = os.path.join(MODELS_DIR, uid, "bilstm.keras")
+    st = os.stat(model_path)                      # FileNotFoundError = belum dilatih
+    fingerprint = (st.st_mtime_ns, st.st_size)
+    cached = _model_cache.get(uid)
+    if cached is None or cached[0] != fingerprint:
+        _model_cache[uid] = (fingerprint, tf.keras.models.load_model(model_path))
+    return _model_cache[uid][1]
+
+
 def predict_bilstm(X: np.ndarray, uid: str) -> np.ndarray:
-    if uid not in _model_cache:
-        model_path = os.path.join(MODELS_DIR, uid, "bilstm.keras")
-        _model_cache[uid] = tf.keras.models.load_model(model_path)
-    model = _model_cache[uid]
+    model = _load_model(uid)
 
     # Model lama dilatih sebelum fitur curah hujan ditambahkan, jadi bentuk
     # inputnya beda. Tanpa penjagaan ini Keras melempar galat bentuk mentah
