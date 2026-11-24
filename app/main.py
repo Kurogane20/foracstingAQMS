@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time as _time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 if os.getenv("LOKY_MAX_CPU_COUNT"):
@@ -14,6 +15,7 @@ from app.routers.training import router as training_router
 from app.routers.accuracy import router as accuracy_router
 from app.routers.dispersion import router as dispersion_router
 from app.config import LOGS_DIR
+from app.scheduler import detik_hingga_menit, menit_jadwal, scheduler_aktif
 
 os.makedirs(LOGS_DIR, exist_ok=True)
 logging.basicConfig(
@@ -30,10 +32,13 @@ app.include_router(dispersion_router)
 
 
 def _hourly_predict_worker() -> None:
-    """Background thread: run predict for all sensors every hour."""
+    """Background thread: prediksi semua sensor tiap jam pada menit tetap (lihat app/scheduler.py)."""
     logger = logging.getLogger(__name__)
+    menit = menit_jadwal()
     while True:
-        _time.sleep(3600)
+        tunggu = detik_hingga_menit(datetime.now(timezone.utc), menit)
+        logger.info(f"[scheduler] Prediksi berikutnya dalam {tunggu / 60:.1f} menit (menit :{menit:02d} tiap jam)")
+        _time.sleep(tunggu)
         try:
             from app.db import get_all_uids
             from app.services.predict import predict_sensor
@@ -61,7 +66,10 @@ def _hourly_predict_worker() -> None:
             logger.error(f"[scheduler] Worker cycle failed: {e}")
 
 
-threading.Thread(target=_hourly_predict_worker, daemon=True).start()
+if scheduler_aktif():
+    threading.Thread(target=_hourly_predict_worker, daemon=True).start()
+else:
+    logging.getLogger(__name__).info("[scheduler] Penjadwal internal dimatikan (INTERNAL_SCHEDULER)")
 
 
 @app.get("/health")

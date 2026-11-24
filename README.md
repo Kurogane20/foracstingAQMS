@@ -155,6 +155,17 @@ Nilai koneksi mengikuti `DB_AQMS_*` di `.env` Laravel:
 
 ---
 
+### Penjadwal prediksi
+
+Layanan memprediksi semua sensor sendiri **tiap jam pada menit tetap** (bawaan `:55`, saat ember jam berjalan sudah hampir lengkap), lalu memperbarui nilai aktual dan cek drift. Atur lewat `.env`:
+
+| Variable | Bawaan | Keterangan |
+|---|---|---|
+| `PREDICT_SCHEDULE_MINUTE` | `55` | Menit pada setiap jam (0–59) |
+| `INTERNAL_SCHEDULER` | `1` | `0` mematikan penjadwal internal, mis. bila prediksi dipicu dari luar (`POST /predict/all`) |
+
+---
+
 ## API Endpoints
 
 ### Health & Status
