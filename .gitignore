@@ -25,9 +25,9 @@ build/
 dist/
 
 # ── Artefak model ─────────────────────────────────────────────
-# Seluruh isi saved_models/ dihasilkan oleh retrain (~803 MB):
-# bilstm.keras, lgbm*.pkl, scaler.pkl, shrinkage.json, best_params.
-# Struktur foldernya dipertahankan lewat .gitkeep.
+# Seluruh isi saved_models/ dihasilkan oleh retrain: forecaster.pkl,
+# backtest.json, best_params.json. Struktur foldernya dipertahankan
+# lewat .gitkeep.
 saved_models/*
 !saved_models/.gitkeep
 
@@ -45,10 +45,10 @@ logs/*
 !logs/.gitkeep
 *.log
 
-# ── Keluaran skrip presentasi ─────────────────────────────────
-# Dihasilkan oleh generate_*.py yang ada di repo ini.
-# CATATAN: bila berkas .pptx pernah disunting manual, keluarkan
-# baris ini — kalau tidak, hasil suntingan tidak akan terlacak.
+# ── Dokumen, presentasi, dan skrip pembuatnya ────────────────
+# Disimpan lokal saja, tidak masuk repo.
+docs/
+generate_*.py
 *.pptx
 
 # ── Berkas kerja sementara ────────────────────────────────────

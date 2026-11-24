@@ -1,232 +1,184 @@
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 import pandas as pd
 import pytest
-from app.config import FEATURE_COLS, N_INPUT_HOURS, N_FORECAST_HOURS
-from app.models.preprocessor import resample_hourly, clean, create_sequences, detect_and_remove_anomalies
+
+from app.config import FEATURE_COLS, MIN_READINGS_PER_HOUR
+from app.models import preprocessor as pp
 
 
-def test_resample_hourly_returns_24_rows(sample_minute_df):
-    result = resample_hourly(sample_minute_df)
-    assert len(result) == 24
-    assert list(result.columns) == FEATURE_COLS
+def _rows(hours, n=60, **overrides):
+    """Baris agregat seperti keluaran fetch_hourly_rows untuk jam-jam `hours`."""
+    data = {"hour_start": [int(pd.Timestamp(h).timestamp()) for h in hours],
+            pp.COUNT_COL: n}
+    for col in FEATURE_COLS:
+        data[col] = overrides.get(col, {"noise": 55.0, "temp": 28.0, "mmhg": 757.0,
+                                        "humidity": 80.0}.get(col, 50.0))
+    return pd.DataFrame(data)
 
 
-def test_resample_hourly_index_is_datetime(sample_minute_df):
-    result = resample_hourly(sample_minute_df)
-    assert isinstance(result.index, pd.DatetimeIndex)
+# ── to_hourly_frame ──────────────────────────────────────────────────────────
+
+def test_hourly_frame_is_continuous_with_nan_for_missing_hours():
+    """Jam tanpa data harus hadir sebagai baris NaN: fitur lag memakai shift(k)
+    dan menganggap baris ke-k di belakang adalah k JAM yang lalu."""
+    rows = _rows(["2026-03-01 00:00", "2026-03-01 01:00", "2026-03-01 04:00"])
+    frame = pp.to_hourly_frame(rows)
+    assert len(frame) == 5
+    assert (frame.index[1:] - frame.index[:-1] == pd.Timedelta(hours=1)).all()
+    assert frame.loc["2026-03-01 02:00":"2026-03-01 03:00", "tsp"].isna().all()
+    assert frame.loc["2026-03-01 04:00", "tsp"] == 50.0
 
 
-def test_clean_fills_missing_values(sample_hourly_df):
-    df = sample_hourly_df.copy()
-    df.iloc[5, 0] = np.nan
-    result = clean(df)
-    assert not result.isnull().any().any()
+def test_hourly_frame_accepts_mysql_decimal_and_null():
+    """MySQL mengembalikan Decimal untuk FLOOR()/AVG() dan None untuk AVG kosong."""
+    rows = pd.DataFrame({
+        "hour_start": [Decimal("1772323200"), Decimal("1772326800")],
+        pp.COUNT_COL: [60, 58],
+        **{c: [Decimal("12.5"), None] for c in FEATURE_COLS},
+    })
+    frame = pp.to_hourly_frame(rows)
+    assert frame["tsp"].dtype == np.float64
+    assert frame["tsp"].iloc[0] == 12.5
+    assert np.isnan(frame["tsp"].iloc[1])
+    assert frame.index[0] == pd.Timestamp("2026-03-01 00:00")
 
 
-def test_clean_preserves_real_exceedance():
-    """Regresi: pemotongan Tukey yang lama membuang 59% jam pelampauan baku mutu
-    (pagar per sensor 89–252 µg/m³ vs baku mutu 230), sehingga model tidak pernah
-    melihat kejadian yang paling perlu diprediksi. Puncak nyata harus lolos utuh."""
-    n = 200
-    index = pd.date_range("2024-01-01", periods=n, freq="h")
-    df = pd.DataFrame({col: np.full(n, 40.0) for col in FEATURE_COLS}, index=index)
-    df["temp"] = 28.0
-    df["mmhg"] = 760.0
-    df["humidity"] = 82.0
-    df["noise"] = 55.0
-    df.loc[df.index[100], "tsp"] = 420.0      # kejadian debu nyata di atas baku mutu
-
-    result = clean(detect_and_remove_anomalies(df))
-
-    assert result.loc[df.index[100], "tsp"] == pytest.approx(420.0)
+def test_hourly_frame_empty_input():
+    frame = pp.to_hourly_frame(pd.DataFrame(columns=["hour_start", pp.COUNT_COL] + FEATURE_COLS))
+    assert frame.empty
 
 
-def test_clean_rejects_physically_impossible_value(sample_hourly_df):
-    df = sample_hourly_df.copy()
-    df.loc[df.index[0], "tsp"] = 999999.0     # mustahil: sensor rusak
-    result = clean(detect_and_remove_anomalies(df))
-    assert result.loc[df.index[0], "tsp"] < 999999.0
+# ── apply_quality_filters ────────────────────────────────────────────────────
+
+def test_hours_with_too_few_readings_are_blanked():
+    hours = pd.date_range("2026-03-01", periods=3, freq="h")
+    rows = _rows(hours)
+    rows.loc[1, pp.COUNT_COL] = MIN_READINGS_PER_HOUR - 1
+    clean = pp.apply_quality_filters(pp.to_hourly_frame(rows))
+    assert clean.iloc[1].isna().all()
+    assert clean.iloc[0].notna().all() and clean.iloc[2].notna().all()
 
 
-def test_clean_fills_column_that_is_entirely_invalid(sample_hourly_df):
-    """Sebagian sensor tidak punya modul cuaca dan melaporkan nol terus-menerus.
-    Kolom seperti itu harus diisi nilai cadangan, bukan menggagalkan retrain."""
-    df = sample_hourly_df.copy()
-    df["mmhg"] = 0.0                          # di luar batas fisik seluruhnya
-    result = clean(detect_and_remove_anomalies(df))
-    assert not result.isnull().any().any()
-    assert result["mmhg"].iloc[0] == pytest.approx(760.0)
+def test_physically_impossible_values_are_blanked_not_clipped():
+    hours = pd.date_range("2026-03-01", periods=4, freq="h")
+    rows = _rows(hours)
+    rows.loc[1, "tsp"] = -171.9        # negatif: nyata ada di data ekspor
+    rows.loc[2, "tsp"] = 9999.0
+    rows.loc[3, "temp"] = 0.0          # sensor tanpa modul cuaca melapor nol
+    clean = pp.apply_quality_filters(pp.to_hourly_frame(rows))
+    assert np.isnan(clean["tsp"].iloc[1]) and np.isnan(clean["tsp"].iloc[2])
+    assert np.isnan(clean["temp"].iloc[3])
+    assert clean["pm_10"].notna().all()
 
 
-def test_create_sequences_output_shapes(sample_sequence_data):
-    X, y = create_sequences(sample_sequence_data, N_INPUT_HOURS, N_FORECAST_HOURS)
-    n_samples = len(sample_sequence_data) - N_INPUT_HOURS - N_FORECAST_HOURS + 1
-    assert X.shape == (n_samples, N_INPUT_HOURS, len(FEATURE_COLS))
-    assert y.shape == (n_samples, N_FORECAST_HOURS, len(FEATURE_COLS))
+def test_real_dust_events_survive_filtering():
+    """TSP 1.400 µg/m³ itu buruk, tapi nyata — tidak boleh dibuang."""
+    rows = _rows(pd.date_range("2026-03-01", periods=2, freq="h"))
+    rows.loc[1, "tsp"] = 1400.0
+    clean = pp.apply_quality_filters(pp.to_hourly_frame(rows))
+    assert clean["tsp"].iloc[1] == 1400.0
 
 
-def test_create_sequences_values_are_contiguous(sample_sequence_data):
-    X, y = create_sequences(sample_sequence_data, N_INPUT_HOURS, N_FORECAST_HOURS)
-    np.testing.assert_array_equal(X[0], sample_sequence_data[:N_INPUT_HOURS])
-    np.testing.assert_array_equal(y[0], sample_sequence_data[N_INPUT_HOURS:N_INPUT_HOURS + N_FORECAST_HOURS])
+def test_gaps_are_never_interpolated():
+    """Regresi: versi lama mengisi celah berhari-hari dengan garis lurus dan
+    melatihkannya sebagai pengukuran."""
+    rows = _rows(["2026-03-01 00:00", "2026-03-03 00:00"])
+    rows.loc[0, "tsp"], rows.loc[1, "tsp"] = 10.0, 500.0
+    clean = pp.apply_quality_filters(pp.to_hourly_frame(rows))
+    assert len(clean) == 49
+    assert clean["tsp"].notna().sum() == 2
 
 
-def test_detect_and_remove_anomalies_replaces_impossible_spike(sample_hourly_df):
-    df = sample_hourly_df.copy()
-    df.loc[df.index[12], "pm_25"] = 99999.0   # di luar batas fisik
-    result = detect_and_remove_anomalies(df)
-    assert result.loc[df.index[12], "pm_25"] < 99999.0
+def test_filters_return_only_feature_cols():
+    clean = pp.apply_quality_filters(pp.to_hourly_frame(_rows(pd.date_range("2026-03-01", periods=2, freq="h"))))
+    assert list(clean.columns) == FEATURE_COLS
 
 
-def test_detect_and_remove_anomalies_no_nans(sample_hourly_df):
-    df = sample_hourly_df.copy()
-    df.loc[df.index[5], "pm_25"] = 99999.0
-    result = detect_and_remove_anomalies(df)
-    assert not result.isnull().any().any()
+# ── drop_incomplete_hour / extend_to ─────────────────────────────────────────
 
-
-def test_detect_and_remove_anomalies_preserves_normal(sample_hourly_df):
-    result = detect_and_remove_anomalies(sample_hourly_df)
-    # Data yang seluruhnya masuk akal secara fisik tidak boleh diubah sama sekali.
-    changed = (~np.isclose(result.values, sample_hourly_df.values, atol=1e-6)).sum()
-    assert changed == 0
-
-
-def test_detect_and_remove_anomalies_keeps_sustained_dust_event():
-    """Penyaring 3-sigma yang lama menghapus kejadian debu berjam-jam karena
-    kejadian nyata memang melewati ambang statistik. Batas fisik tidak boleh."""
-    n = 120
-    index = pd.date_range("2024-01-01", periods=n, freq="h")
-    df = pd.DataFrame({col: np.full(n, 30.0) for col in FEATURE_COLS}, index=index)
-    df["temp"] = 28.0
-    df["mmhg"] = 760.0
-    df["humidity"] = 82.0
-    df["noise"] = 55.0
-    df.loc[index[60:66], "tsp"] = 500.0        # 6 jam berdebu berat, nyata
-
-    result = detect_and_remove_anomalies(df)
-
-    assert result.loc[index[60:66], "tsp"].tolist() == [500.0] * 6
-
-
-def test_delta_round_trip_is_lossless():
-    from app.models.preprocessor import anchor_from_X, to_delta, from_delta
-    from app.config import N_FEATURES
-    rng = np.random.default_rng(0)
-    X = rng.normal(size=(7, N_INPUT_HOURS, N_FEATURES + 8))
-    y = rng.normal(size=(7, N_FORECAST_HOURS, N_FEATURES))
-    anchor = anchor_from_X(X)
-    np.testing.assert_allclose(from_delta(to_delta(y, anchor), anchor), y, atol=1e-12)
-
-
-def test_anchor_is_last_observed_sensor_row():
-    from app.models.preprocessor import anchor_from_X
-    from app.config import N_FEATURES
-    rng = np.random.default_rng(1)
-    X = rng.normal(size=(3, N_INPUT_HOURS, N_FEATURES + 8))
-    np.testing.assert_array_equal(anchor_from_X(X), X[:, -1, :N_FEATURES])
-
-
-def test_zero_delta_reproduces_persistence():
-    """Inti perbaikan: selisih nol HARUS menghasilkan tebakan naif 'nilai H+h =
-    nilai sekarang'. Itulah yang membuat persistence jadi perilaku bawaan model
-    dan mencegahnya kalah telak dari baseline seperti pada uji 1 Agu 2026."""
-    from app.models.preprocessor import anchor_from_X, from_delta
-    from app.config import N_FEATURES
-    rng = np.random.default_rng(2)
-    X = rng.normal(size=(5, N_INPUT_HOURS, N_FEATURES + 8))
-    anchor = anchor_from_X(X)
-    persistence = from_delta(np.zeros((5, N_FORECAST_HOURS, N_FEATURES)), anchor)
-    for step in range(N_FORECAST_HOURS):
-        np.testing.assert_array_equal(persistence[:, step, :], anchor)
-
-
-def test_scaler_fit_rows_stops_at_last_training_row():
-    """Sekuens latih terakhir menyentuh baris split-1 + jendela - 1; scaler
-    tidak boleh melihat baris sesudahnya."""
-    from app.models.preprocessor import scaler_fit_rows, train_split_index
-    n_rows = 1000
-    window = N_INPUT_HOURS + N_FORECAST_HOURS
-    n_seq = n_rows - window + 1
-    split = train_split_index(n_seq)
-    assert scaler_fit_rows(n_rows) == split + window - 1
-    assert scaler_fit_rows(n_rows) < n_rows
-
-
-def test_scaler_does_not_see_validation_extremes(tmp_path, monkeypatch):
-    """Regresi kebocoran: sebelumnya scaler di-fit pada seluruh deret, sehingga
-    nilai ekstrem yang hanya muncul di porsi validasi ikut menentukan skala."""
-    import joblib
-    from app.models import preprocessor as pp
-    monkeypatch.setattr(pp, "MODELS_DIR", str(tmp_path))
-
-    n = 600
-    idx = pd.date_range("2024-01-01", periods=n, freq="h")
-    df = pd.DataFrame({c: np.full(n, 40.0) for c in FEATURE_COLS}, index=idx)
-    df["temp"], df["mmhg"], df["humidity"], df["noise"] = 28.0, 760.0, 82.0, 55.0
-    df.loc[idx[-5], "tsp"] = 900.0              # ekstrem HANYA di ujung validasi
-
-    fit_end = pp.scaler_fit_rows(n)
-    pp.normalize(df.iloc[:fit_end], "uid_x", fit=True)
-    scaler = joblib.load(tmp_path / "uid_x" / "scaler.pkl")["scaler"]
-
-    tsp_i = FEATURE_COLS.index("tsp")
-    assert scaler.data_max_[tsp_i] < np.log1p(900.0)   # ekstrem validasi tak terlihat
-
-
-def test_sequence_base_times_is_last_observed_hour():
-    """Jam dasar tiap sekuens = jam input terakhir — persis `last_time` di jalur
-    prediksi. Sebelumnya LightGBM dilatih dengan jam sintetis 2024-01-01 + i,
-    sehingga fitur jam/hari/bulannya bergeser dari yang dilihat saat produksi."""
-    from app.models.preprocessor import sequence_base_times
-    n = 100
-    index = pd.date_range("2025-10-03 07:00", periods=n, freq="h")
-    data = np.arange(n, dtype=float)[:, np.newaxis]    # nilai = posisi baris
-    X, _ = create_sequences(data, N_INPUT_HOURS, N_FORECAST_HOURS)
-    base_times = sequence_base_times(index)
-    assert len(base_times) == len(X)
-    for i in (0, 17, len(X) - 1):
-        assert base_times[i] == index[int(X[i, -1, 0])]
-
-
-def test_preprocess_for_training_returns_real_base_times(tmp_path, monkeypatch):
-    import app.db
-    from app.models import preprocessor as pp
-    monkeypatch.setattr(pp, "MODELS_DIR", str(tmp_path))
-    n = 120
-    idx = pd.date_range("2025-10-03 07:00", periods=n, freq="h")
-    df = pd.DataFrame({c: np.full(n, 40.0) for c in FEATURE_COLS}, index=idx)
-    df["temp"], df["mmhg"], df["humidity"], df["noise"] = 28.0, 760.0, 82.0, 55.0
-    # Bentuk baris mentah t_loggers: stempel waktu unix sebagai kolom.
-    df["datetime_unix"] = (idx - pd.Timestamp("1970-01-01")) // pd.Timedelta("1s")
-    df = df.reset_index(drop=True)
-    monkeypatch.setattr(pp, "fetch_sensor_data", lambda uid, hours: df)
-    monkeypatch.setattr(app.db, "get_sensor_lat_lng", lambda uid: None)
-
-    X, y, base_times = pp.preprocess_for_training("uid_x")
-
-    assert len(base_times) == len(X) == len(y)
-    assert base_times[0] == idx[N_INPUT_HOURS - 1]
-    assert base_times[-1] == idx[n - N_FORECAST_HOURS - 1]
-
-
-def test_drop_incomplete_hour_removes_running_hour():
-    """Bin jam berjalan hanya berisi beberapa menit; bila tersisa ia menjadi
-    jangkar prediksi, padahal saat latih jangkar selalu rata-rata jam penuh."""
-    from app.models.preprocessor import drop_incomplete_hour
-    idx = pd.date_range("2026-10-01 08:00", periods=4, freq="h")      # 08..11 UTC
+def test_drop_incomplete_hour_removes_running_bin():
+    idx = pd.date_range("2026-03-01 00:00", periods=4, freq="h")
     df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0, 4.0]}, index=idx)
-
-    out = drop_incomplete_hour(df, now=pd.Timestamp("2026-10-01 11:20"))
-    assert out.index[-1] == pd.Timestamp("2026-10-01 10:00")
-
-    out = drop_incomplete_hour(df, now=pd.Timestamp("2026-10-01 12:00"))
-    assert out.index[-1] == pd.Timestamp("2026-10-01 11:00")
+    out = pp.drop_incomplete_hour(df, now=pd.Timestamp("2026-03-01 03:20", tz="UTC"))
+    assert out.index[-1] == pd.Timestamp("2026-03-01 02:00")
 
 
-def test_drop_incomplete_hour_converts_aware_now_to_utc():
-    from app.models.preprocessor import drop_incomplete_hour
-    idx = pd.date_range("2026-10-01 08:00", periods=4, freq="h")
+def test_drop_incomplete_hour_handles_local_timezone():
+    idx = pd.date_range("2026-03-01 00:00", periods=4, freq="h")
     df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0, 4.0]}, index=idx)
-    now_wita = pd.Timestamp("2026-10-01 19:20", tz="Asia/Makassar")   # = 11:20 UTC
-    assert drop_incomplete_hour(df, now=now_wita).index[-1] == pd.Timestamp("2026-10-01 10:00")
+    # 11:20 WITA = 03:20 UTC
+    out = pp.drop_incomplete_hour(df, now=pd.Timestamp("2026-03-01 11:20", tz="Asia/Makassar"))
+    assert out.index[-1] == pd.Timestamp("2026-03-01 02:00")
+
+
+def test_extend_to_pads_offline_sensor_with_nan():
+    """Sensor mati 5 jam: indeks tetap harus sampai jam penuh terakhir, supaya
+    prakiraan tidak berangkat dari — dan dilabeli — jam yang sudah lewat."""
+    idx = pd.date_range("2026-03-01 00:00", periods=3, freq="h")
+    df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0]}, index=idx)
+    out = pp.extend_to(df, pd.Timestamp("2026-03-01 07:00"))
+    assert out.index[-1] == pd.Timestamp("2026-03-01 07:00")
+    assert out["tsp"].iloc[3:].isna().all()
+    assert out["tsp"].iloc[:3].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_extend_to_is_noop_when_current():
+    idx = pd.date_range("2026-03-01 00:00", periods=3, freq="h")
+    df = pd.DataFrame({"tsp": [1.0, 2.0, 3.0]}, index=idx)
+    assert pp.extend_to(df, idx[-1]).equals(df)
+
+
+# ── fetch_hourly_rows / load_hourly ──────────────────────────────────────────
+
+def test_fetch_hourly_rows_aggregates_in_sql_and_closes_connection():
+    cursor = MagicMock()
+    cursor.description = [("hour_start",), (pp.COUNT_COL,)] + [(c,) for c in FEATURE_COLS]
+    cursor.fetchall.return_value = [(1772323200, 60) + (1.0,) * len(FEATURE_COLS)]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    with patch("app.models.preprocessor.mysql.connector.connect", return_value=conn), \
+         patch("app.models.preprocessor.time.time", return_value=1772330000.0):
+        rows = pp.fetch_hourly_rows("AQI01B", hours=24)
+
+    sql, params = cursor.execute.call_args[0]
+    assert "GROUP BY hour_start" in sql and "COUNT(*)" in sql and "AVG(`tsp`)" in sql
+    assert "deleted_at IS NULL" in sql
+    uid, cutoff = params
+    assert uid == "AQI01B"
+    # Batas bawah jatuh tepat di awal jam, jadi bin pertama tidak pernah terpotong.
+    assert cutoff % 3600 == 0
+    assert cutoff == (1772330000 // 3600 - 24) * 3600
+    assert list(rows.columns) == ["hour_start", pp.COUNT_COL] + FEATURE_COLS
+    conn.close.assert_called_once()
+
+
+def test_fetch_hourly_rows_closes_connection_on_error():
+    conn = MagicMock()
+    conn.cursor.side_effect = RuntimeError("boom")
+    with patch("app.models.preprocessor.mysql.connector.connect", return_value=conn):
+        with pytest.raises(RuntimeError):
+            pp.fetch_hourly_rows("AQI01B", hours=24)
+    conn.close.assert_called_once()
+
+
+def test_load_hourly_drops_running_hour_and_extends_to_last_full_hour():
+    hours = pd.date_range("2026-03-01 00:00", periods=6, freq="h")   # 00..05
+    rows = _rows(hours)
+    now = pd.Timestamp("2026-03-01 08:10", tz="UTC")                 # jam penuh terakhir: 07
+    with patch("app.models.preprocessor.fetch_hourly_rows", return_value=rows):
+        df = pp.load_hourly("AQI01B", hours=48, now=now)
+    assert df.index[-1] == pd.Timestamp("2026-03-01 07:00")
+    assert df["tsp"].iloc[-2:].isna().all()
+    assert df["tsp"].iloc[:6].notna().all()
+
+
+def test_load_hourly_excludes_the_hour_in_progress():
+    hours = pd.date_range("2026-03-01 00:00", periods=6, freq="h")   # 00..05
+    now = pd.Timestamp("2026-03-01 05:30", tz="UTC")
+    with patch("app.models.preprocessor.fetch_hourly_rows", return_value=_rows(hours)):
+        df = pp.load_hourly("AQI01B", hours=48, now=now)
+    assert df.index[-1] == pd.Timestamp("2026-03-01 04:00")

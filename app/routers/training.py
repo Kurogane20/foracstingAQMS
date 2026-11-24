@@ -1,8 +1,10 @@
-from fastapi import APIRouter, BackgroundTasks, Depends
+import re
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from app.auth import require_api_key
 from app.db import get_all_uids, upsert_lat_lng
+from app.models.pipeline import load_report
 from app.services.retrain import retrain_sensor
 from app.training_progress import training_progress
 
@@ -42,3 +44,15 @@ def get_training_progress(uid: str):
     if prog is None:
         return {"phase": "idle", "percent": 0, "epoch": None, "total_epochs": None, "eta_seconds": None}
     return prog
+
+
+@router.get("/training/report/{uid}", dependencies=[Depends(require_api_key)])
+def get_training_report(uid: str):
+    """Laporan backtest rolling-origin dari pelatihan terakhir: MAE/RMSE/bias per
+    parameter dan per horizon dalam satuan fisik, skill terhadap persistence dan
+    persistence musiman, cakupan interval, dan deteksi pelampauan."""
+    # uid menjadi nama folder; tolak apa pun yang bisa keluar dari saved_models/.
+    report = load_report(uid) if re.fullmatch(r"[A-Za-z0-9_.-]+", uid) and ".." not in uid else None
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Belum ada laporan untuk {uid} — jalankan /retrain")
+    return report

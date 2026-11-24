@@ -1,177 +1,199 @@
+"""Alur latih dan prediksi per sensor."""
+import json
+import os
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
-from app.config import FEATURE_COLS, N_FORECAST_HOURS, N_INPUT_HOURS
 
-# Sekuens yang dibuang di tiap batas (latih|validasi, kalibrasi|pelaporan) agar
-# jendela target tidak tumpang-tindih.
-PURGE_SEQUENCES = N_FORECAST_HOURS
-MIN_EVAL_SEQUENCES = 20
-from app.models.preprocessor import (
-    preprocess_for_predict,
-    preprocess_for_training,
-    denormalize,
-    anchor_from_X,
-    to_delta,
-    from_delta,
-    train_split_index,
+from app.config import (
+    FEATURE_COLS, MODELS_DIR, N_FORECAST_HOURS, PHYSICAL_LIMITS, PRIMARY_PARAM,
+    MAX_ANCHOR_AGE_HOURS,
 )
-from app.models.bilstm import predict_bilstm, train_bilstm
-from app.models.shrinkage import (
-    fit_alpha, save_alpha, load_alpha, apply_alpha, recenter_band,
+from app.models.backtest import (
+    backtest_target, fit_calibration, normalized_mae, plan_folds, score_target,
 )
-from app.models.lgbm import predict_lgbm, train_lgbm
+from app.models.calibration import calibrated_deltas
+from app.models.features import build_rows, from_model_space, to_model_space
+from app.models.forecaster import fit_models, load_bundle, predict_deltas, save_bundle
+from app.models.preprocessor import load_for_predict, load_for_training
 from app.training_progress import set_phase
+
+REPORT_FILENAME = "backtest.json"
+
+# Parameter dengan jam teramati lebih sedikit dari ini tidak dimodelkan (mis.
+# suhu/tekanan/kelembapan pada sensor tanpa modul cuaca, yang melapor nol terus).
+MIN_TARGET_HOURS = 24 * 14
+
+
+def report_path(uid: str) -> str:
+    return os.path.join(MODELS_DIR, uid, REPORT_FILENAME)
+
+
+def load_report(uid: str) -> dict | None:
+    path = report_path(uid)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def fit_sensor(df: pd.DataFrame, lgbm_params: dict | None = None,
+               on_progress=None) -> tuple[dict, dict, dict]:
+    """Latih dan evaluasi semua parameter dari satu deret per jam. Tanpa I/O.
+
+    Per parameter: (1) backtest rolling-origin → prakiraan luar-sampel,
+    (2) kalibrasi α dan interval dari SELURUH prakiraan luar-sampel itu,
+    (3) latih ulang model akhir pada seluruh data. Skor yang dilaporkan berasal
+    dari langkah 1, jadi sedikit konservatif: model akhir melihat lebih banyak
+    data daripada model mana pun yang dinilai.
+
+    Mengembalikan (bundel model, laporan backtest, ringkasan).
+    """
+    folds = plan_folds(df.index)
+    z = to_model_space(df)
+
+    targets: dict[str, dict] = {}
+    scores: dict[str, dict] = {}
+    norm_maes: list[float] = []
+    skipped: list[str] = []
+
+    for i, col in enumerate(FEATURE_COLS):
+        if on_progress is not None:
+            on_progress(i / len(FEATURE_COLS))
+        if int(z[col].notna().sum()) < MIN_TARGET_HOURS:
+            skipped.append(col)
+            continue
+        X, meta = build_rows(z, col)
+        oos = backtest_target(X, meta, z[col], folds, lgbm_params)
+        col_scores = score_target(oos, col)
+        if col_scores is None:
+            skipped.append(col)
+            continue
+
+        alpha, conformal = fit_calibration(oos)
+        fit = meta["delta"].notna().values
+        targets[col] = {
+            "models": fit_models(X[fit], meta.loc[fit, "delta"].values, lgbm_params),
+            "alpha": alpha,
+            "conformal": conformal,
+            "features": list(X.columns),
+        }
+        scores[col] = col_scores
+        nm = normalized_mae(oos, z[col])
+        if nm is not None:
+            norm_maes.append(nm)
+
+    if not targets:
+        raise ValueError("Insufficient data: tidak ada parameter yang cukup datanya")
+
+    trained_until = df.index[-1]
+    bundle = {
+        "targets": targets,
+        "trained_until": trained_until.isoformat(),
+        "params": lgbm_params or {},
+    }
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "method": "LightGBM langsung multi-horizon (selisih log, fitur lag + musiman harian)",
+        "data": {
+            "start": df.index[0].isoformat(), "end": trained_until.isoformat(),
+            "hours": int(len(df)),
+            "hours_observed": {c: int(df[c].notna().sum()) for c in FEATURE_COLS},
+        },
+        "folds": [{"start": s.isoformat(), "end": e.isoformat()} for s, e in folds],
+        "skipped_targets": skipped,
+        "targets": scores,
+    }
+    primary = scores.get(PRIMARY_PARAM, {}).get("overall", {})
+    summary = {
+        "training_samples": int(df[PRIMARY_PARAM].notna().sum()),
+        # Tanpa satuan, hanya untuk lencana "% acc" di dasbor (lihat normalized_mae).
+        "mae_score": round(float(np.mean(norm_maes)), 6),
+        # Yang bermakna: TSP dalam µg/m³, dari lipatan luar-sampel.
+        "mae_tsp": primary.get("mae"),
+        "mae_persistence_tsp": primary.get("mae_persistence"),
+        "skill_vs_naive": primary.get("skill_vs_persistence"),
+        "skill_vs_seasonal_naive": primary.get("skill_vs_seasonal_naive"),
+        "coverage_tsp": primary.get("coverage"),
+        "trained_targets": list(targets),
+        "skipped_targets": skipped,
+        "folds": len(folds),
+    }
+    return bundle, report, summary
+
+
+def run_training(uid: str, lgbm_params: dict | None = None,
+                 hourly: pd.DataFrame | None = None) -> dict:
+    """Latih satu sensor, simpan model dan laporan backtest, kembalikan ringkasan."""
+    df = hourly if hourly is not None else load_for_training(uid)
+    bundle, report, summary = fit_sensor(
+        df, lgbm_params,
+        on_progress=lambda frac: set_phase(uid, phase="training", percent=5 + int(90 * frac)),
+    )
+    save_bundle(uid, bundle)
+    with open(report_path(uid), "w", encoding="utf-8") as fh:
+        json.dump({"uid": uid, **report}, fh, ensure_ascii=False, indent=1)
+    return summary
+
+
+def _clip(values: np.ndarray, col: str) -> np.ndarray:
+    limits = PHYSICAL_LIMITS.get(col)
+    return values if limits is None else np.clip(values, limits[0], limits[1])
 
 
 def run_prediction(uid: str) -> list:
-    X, timestamps = preprocess_for_predict(uid)
-    last_time = timestamps[-1]
+    """Prakiraan 6 jam ke depan dari jam penuh terakhir.
 
-    # Model meramal SELISIH terhadap nilai terakhir teramati, jadi jangkarnya
-    # harus ditambahkan kembali sebelum denormalisasi.
-    anchor = anchor_from_X(X)                                   # (1, 14)
+    Langkah 1 adalah jam yang sedang berjalan — jam pertama yang belum teramati
+    penuh. Parameter yang tidak dimodelkan, atau yang bacaan terakhirnya lebih
+    tua dari MAX_ANCHOR_AGE_HOURS, bernilai None: tidak ada angka karangan.
+    """
+    bundle = load_bundle(uid)                      # FileNotFoundError = belum dilatih
+    df = load_for_predict(uid)
+    if df.empty:
+        raise ValueError(f"Insufficient hourly data for uid={uid}: tidak ada data")
+    z = to_model_space(df)
+    last_time = z.index[-1]
+    origin = pd.DatetimeIndex([last_time])
 
-    bilstm_out = predict_bilstm(X, uid)                         # (1, 6, 14) selisih
-    lgbm_result = predict_lgbm(bilstm_out[0], last_time, uid, anchor[0])
+    point = {c: [None] * N_FORECAST_HOURS for c in FEATURE_COLS}
+    lower = {c: [None] * N_FORECAST_HOURS for c in FEATURE_COLS}
+    upper = {c: [None] * N_FORECAST_HOURS for c in FEATURE_COLS}
+    n_forecast = 0
 
-    # Susutkan selisih menuju persistence memakai bobot hasil validasi.
-    alpha = load_alpha(uid)
-    point_raw = lgbm_result["point"]
-    point_shrunk = apply_alpha(point_raw, alpha)
+    for col in FEATURE_COLS:
+        spec = bundle["targets"].get(col)
+        if spec is None:
+            continue
+        X, meta = build_rows(z, col, origins=origin)
+        if X.empty:                                # jangkar basi / tidak ada
+            continue
+        # Kolom konteks bisa berbeda dari saat latih bila sebuah parameter kosong
+        # total di jendela prediksi; kolom yang hilang masuk sebagai NaN.
+        raw = predict_deltas(spec["models"], X.reindex(columns=spec["features"]))
+        h = meta["h"].values
+        p, lo, hi = calibrated_deltas(raw["point"], raw["lower"], raw["upper"], h,
+                                      spec["alpha"], spec["conformal"])
+        anchor = meta["anchor"].values
+        for values, store in ((p, point), (lo, lower), (hi, upper)):
+            phys = _clip(from_model_space(anchor + values, col), col)
+            for step, v in zip(h, phys):
+                store[col][step - 1] = float(v)
+        n_forecast += 1
 
-    def _to_abs(delta):
-        if delta is None:
-            return None
-        return denormalize(from_delta(delta[np.newaxis, ...], anchor)[0], uid)
-
-    final_point = _to_abs(point_shrunk)                         # (6, 14)
-    # Pita kuantil digeser mengikuti titik yang disusutkan, lebarnya dipertahankan
-    # — ketidakpastian tidak berkurang hanya karena titiknya ditarik ke persistence.
-    final_lower = _to_abs(recenter_band(point_shrunk, point_raw, lgbm_result["lower"])
-                          if lgbm_result.get("lower") is not None else None)
-    final_upper = _to_abs(recenter_band(point_shrunk, point_raw, lgbm_result["upper"])
-                          if lgbm_result.get("upper") is not None else None)
-
-    # Kuantil bisa saling menyilang setelah koreksi LightGBM per-keluaran;
-    # pita yang terbalik akan tampil aneh di grafik dan merusak ambang p90.
-    if final_lower is not None and final_upper is not None:
-        final_lower, final_upper = (
-            np.minimum(final_lower, final_upper),
-            np.maximum(final_lower, final_upper),
+    if n_forecast == 0:
+        raise ValueError(
+            f"Data sensor {uid} basi: tidak ada bacaan sah dalam "
+            f"{MAX_ANCHOR_AGE_HOURS + 1} jam terakhir, prakiraan tidak dibuat."
         )
 
     results = []
-    for step in range(N_FORECAST_HOURS):
-        target_time = last_time + pd.Timedelta(hours=step + 1)
-        row = {"step": step + 1, "target_time": target_time.isoformat()}
-        for i, col in enumerate(FEATURE_COLS):
-            row[col] = float(final_point[step, i])
-        row["lower_bounds"] = (
-            {col: float(final_lower[step, i]) for i, col in enumerate(FEATURE_COLS)}
-            if final_lower is not None else None
-        )
-        row["upper_bounds"] = (
-            {col: float(final_upper[step, i]) for i, col in enumerate(FEATURE_COLS)}
-            if final_upper is not None else None
-        )
+    for step in range(1, N_FORECAST_HOURS + 1):
+        row = {"step": step, "target_time": (last_time + pd.Timedelta(hours=step)).isoformat()}
+        for col in FEATURE_COLS:
+            row[col] = point[col][step - 1]
+        row["lower_bounds"] = {c: lower[c][step - 1] for c in FEATURE_COLS}
+        row["upper_bounds"] = {c: upper[c][step - 1] for c in FEATURE_COLS}
         results.append(row)
     return results
-
-
-def run_training(uid: str, bilstm_params: dict = None, lgbm_params: dict = None,
-                 X: np.ndarray = None, y: np.ndarray = None,
-                 base_times: pd.DatetimeIndex = None) -> dict:
-    if X is None or y is None:
-        X, y, base_times = preprocess_for_training(uid)
-    elif base_times is None or len(base_times) != len(X):
-        # Tanpa jam nyata, fitur kalender LightGBM terpaksa dikarang — itulah
-        # train/serve skew yang diperbaiki di sini. Lebih baik gagal jelas.
-        raise ValueError(
-            f"run_training({uid}): X/y dari luar wajib disertai base_times "
-            f"sepanjang X (jam input terakhir tiap sekuens)."
-        )
-
-    if len(X) < 10:
-        raise ValueError(f"Insufficient data for {uid}: only {len(X)} sequences")
-
-    split = train_split_index(len(X))
-    # Jendela geser membuat target sekuens latih terakhir tumpang-tindih dengan
-    # target sekuens validasi pertama (N_FORECAST_HOURS baris). Buang sekuens di
-    # celah itu ("purging") agar validasi benar-benar tak pernah terlihat.
-    val_start = min(split + PURGE_SEQUENCES, len(X))
-    X_train, X_val = X[:split], X[val_start:]
-    y_train, y_val = y[:split], y[val_start:]
-    if len(X_val) < 2 * MIN_EVAL_SEQUENCES + PURGE_SEQUENCES:
-        raise ValueError(
-            f"Data validasi {uid} terlalu sedikit ({len(X_val)} sekuens) untuk "
-            f"memisahkan set kalibrasi α dari set pelaporan."
-        )
-
-    # Latih pada selisih terhadap nilai terakhir teramati, bukan level absolut.
-    anchor_train = anchor_from_X(X_train)
-    anchor_val   = anchor_from_X(X_val)
-    dy_train = to_delta(y_train, anchor_train)
-
-    bilstm_kw = bilstm_params or {}
-    train_bilstm(X_train, dy_train, uid, **bilstm_kw)
-
-    set_phase(uid, phase="lgbm", percent=88, eta_seconds=None)
-    bilstm_preds_train = np.array([
-        predict_bilstm(X_train[i : i + 1], uid)[0]
-        for i in range(len(X_train))
-    ])
-    # Jam nyata, bukan 2024-01-01 + i: produksi memberi LightGBM jam sungguhan,
-    # jadi fitur jam/hari/bulan saat latih harus berasal dari jam yang sama.
-    train_lgbm(bilstm_preds_train, dy_train, base_times[:split], uid,
-               anchors=anchor_train, lgbm_params=lgbm_params)
-
-    set_phase(uid, phase="evaluating", percent=95, eta_seconds=None)
-    val_bilstm = np.array([
-        predict_bilstm(X_val[i : i + 1], uid)[0]
-        for i in range(len(X_val))
-    ])
-    val_lgbm = np.array([
-        predict_lgbm(val_bilstm[i], base_times[val_start + i], uid, anchor_val[i])["point"]
-        for i in range(len(X_val))
-    ])
-    dy_val = to_delta(y_val, anchor_val)
-
-    # Validasi dibagi dua secara kronologis: paruh awal HANYA untuk mencari α,
-    # paruh akhir HANYA untuk melaporkan skor. Sebelumnya α dicari dan skor
-    # dilaporkan pada data yang sama, sehingga sebagian keunggulan yang terlihat
-    # adalah hasil penyetelan pada set itu sendiri (bias optimistis). Celah
-    # PURGE_SEQUENCES di antaranya mencegah target kedua paruh tumpang-tindih.
-    n_val = len(X_val)
-    cal_end = (n_val - PURGE_SEQUENCES) // 2
-    rep = slice(cal_end + PURGE_SEQUENCES, None)
-
-    alpha = fit_alpha(val_lgbm[:cal_end], dy_val[:cal_end])
-    save_alpha(uid, alpha)
-
-    # Dievaluasi pada level absolut agar mae_score tetap sebanding antar versi
-    # dan bisa dipakai deteksi drift. Memakai selisih yang SUDAH disusutkan —
-    # inilah yang nanti dipakai produksi — pada data yang tidak dipakai mencari α.
-    y_rep, a_rep, p_rep = y_val[rep], anchor_val[rep], val_lgbm[rep]
-    val_abs = from_delta(apply_alpha(p_rep, alpha), a_rep)
-    mae = float(np.mean(np.abs(val_abs - y_rep)))
-
-    # Baseline persistence pada potongan pelaporan yang sama.
-    naive_abs = from_delta(np.zeros_like(p_rep), a_rep)
-    mae_naive = float(np.mean(np.abs(naive_abs - y_rep)))
-    skill = round(1.0 - mae / mae_naive, 4) if mae_naive > 0 else None
-
-    mae_raw = float(np.mean(np.abs(from_delta(p_rep, a_rep) - y_rep)))
-
-    return {
-        "training_samples": len(X),
-        "mae_score":        round(mae, 6),
-        "mae_persistence":  round(mae_naive, 6),
-        "skill_vs_naive":   skill,
-        # Diagnostik: MAE tanpa penyusutan + rata-rata bobot. alpha_mean mendekati
-        # 0 berarti model tidak menambahkan informasi apa pun di sensor ini.
-        "mae_unshrunk":     round(mae_raw, 6),
-        "alpha_mean":       round(float(alpha.mean()), 4),
-        # Ukuran tiap potongan, agar skor dapat ditafsirkan dengan benar.
-        "alpha_calibration_samples": cal_end,
-        "report_samples":            len(y_rep),
-    }

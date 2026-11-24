@@ -1,171 +1,100 @@
 import json
-import os
-import numpy as np
+from unittest.mock import patch
+
 import pandas as pd
 import pytest
-from unittest.mock import patch, MagicMock
+
+from app.config import FEATURE_SCHEMA_VERSION
+from app.models import tuning
+from app.models.backtest import plan_folds
+from app.models.features import build_rows, to_model_space
+from tests.conftest import make_hourly
 
 
-# ---------------------------------------------------------------------------
-# Tests for save_best_params / load_best_params
-# ---------------------------------------------------------------------------
+# ── save_best_params / load_best_params ──────────────────────────────────────
 
-def test_save_best_params_writes_json(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-    from app.models.tuning import save_best_params
-
-    bilstm = {"units": 128, "dropout": 0.2, "batch_size": 32}
-    lgbm = {"n_estimators": 400, "learning_rate": 0.03, "num_leaves": 63}
-    save_best_params("uid_test", bilstm, lgbm)
-
-    expected_path = tmp_path / "uid_test" / "best_params.json"
-    assert expected_path.exists()
-    with open(expected_path) as f:
-        data = json.load(f)
-    assert data["bilstm"] == bilstm
-    assert data["lgbm"] == lgbm
+def test_params_roundtrip(models_dir):
+    params = {"n_estimators": 250, "learning_rate": 0.04, "num_leaves": 20, "min_child_samples": 30}
+    tuning.save_best_params("u1", params)
+    with open(models_dir / "u1" / tuning.PARAMS_FILENAME) as f:
+        assert json.load(f) == {"schema": FEATURE_SCHEMA_VERSION, "lgbm": params}
+    assert tuning.load_best_params("u1") == params
 
 
-def test_load_best_params_returns_none_when_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-    from app.models.tuning import load_best_params
-
-    result = load_best_params("nonexistent_uid")
-    assert result is None
+def test_load_returns_none_when_missing(models_dir):
+    assert tuning.load_best_params("tidak_ada") is None
 
 
-def test_load_best_params_returns_dict_when_exists(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-    from app.models.tuning import save_best_params, load_best_params
-
-    bilstm = {"units": 64, "dropout": 0.3, "batch_size": 16}
-    lgbm = {"n_estimators": 200, "learning_rate": 0.05, "num_leaves": 31}
-    save_best_params("uid_abc", bilstm, lgbm)
-
-    result = load_best_params("uid_abc")
-    assert result is not None
-    assert result["bilstm"] == bilstm
-    assert result["lgbm"] == lgbm
+def test_params_from_the_old_pipeline_are_ignored(models_dir):
+    """best_params.json lama (BiLSTM + tahap koreksi LightGBM, tanpa kunci skema)
+    disetel untuk masalah lain dan tidak boleh dipakai model baru."""
+    (models_dir / "u1").mkdir()
+    with open(models_dir / "u1" / tuning.PARAMS_FILENAME, "w") as f:
+        json.dump({"bilstm": {"units": 128}, "lgbm": {"n_estimators": 800, "num_leaves": 127}}, f)
+    assert tuning.load_best_params("u1") is None
 
 
-# ---------------------------------------------------------------------------
-# Tests for tune_bilstm
-# ---------------------------------------------------------------------------
+# ── tuning_rows ──────────────────────────────────────────────────────────────
 
-def test_tune_bilstm_returns_correct_keys(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-
-    with patch("app.models.tuning.train_bilstm") as mock_train, \
-         patch("app.models.tuning.predict_bilstm") as mock_predict:
-
-        # predict_bilstm returns array of shape (1, N_FORECAST_HOURS, N_FEATURES)
-        # The objective does: preds = np.array([predict_bilstm(X_val[i:i+1], uid)[0] for i in range(len(X_val))])
-        # predict_bilstm(...)[0] picks element 0 from the returned array
-        mock_predict.return_value = np.zeros((1, 6, 14))
-
-        from app.models.tuning import tune_bilstm, BILSTM_TRIALS
-
-        N = 200
-        X = np.random.randn(N, 24, 18)
-        y = np.random.randn(N, 6, 14)
-
-        result = tune_bilstm(X, y, "uid_bilstm")
-
-    assert isinstance(result, dict)
-    assert "units" in result
-    assert "dropout" in result
-    assert "batch_size" in result
+@pytest.fixture(scope="module")
+def tune_inputs():
+    # Cukup panjang agar tersisa ±7 minggu data SEBELUM lipatan backtest pertama.
+    df = make_hourly(days=220)
+    _, meta = build_rows(to_model_space(df), "tsp")
+    return df, meta, plan_folds(df.index)[0][0]
 
 
-def test_tune_bilstm_scores_only_unseen_purged_sequences(tmp_path, monkeypatch):
-    """Sekuens yang dinilai tidak boleh ikut dilatih, dan targetnya tidak boleh
-    tumpang-tindih dengan target sekuens latih terakhir (celah purge)."""
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-    monkeypatch.setattr("app.models.tuning.BILSTM_TRIALS", 1)
-    from app.models.tuning import tune_bilstm, tuning_split
-
-    N = 200
-    X = np.zeros((N, 24, 18))
-    X[:, 0, 0] = np.arange(N)            # penanda indeks sekuens
-    y = np.zeros((N, 6, 14))
-    trained, scored = [], []
-
-    with patch("app.models.tuning.train_bilstm",
-               side_effect=lambda Xt, yt, uid, **kw: trained.extend(Xt[:, 0, 0])), \
-         patch("app.models.tuning.predict_bilstm",
-               side_effect=lambda Xv, uid: scored.append(Xv[0, 0, 0]) or np.zeros((1, 6, 14))):
-        tune_bilstm(X, y, "uid_bilstm")
-
-    fit_end, eval_start = tuning_split(N)
-    assert max(trained) == fit_end - 1
-    assert min(scored) == eval_start
-    assert eval_start - fit_end >= 6     # N_FORECAST_HOURS
+def test_tuning_never_sees_backtest_folds(tune_inputs):
+    """Lipatan backtest melaporkan skor, jadi tidak boleh memilih hiperparameter."""
+    _, meta, tune_end = tune_inputs
+    fit, evaluate = tuning.tuning_rows(meta, tune_end)
+    used = meta[fit | evaluate]
+    assert ((used["t"] + pd.to_timedelta(used["h"], unit="h")) < tune_end).all()
 
 
-def test_tuning_split_rejects_too_little_data():
-    from app.models.tuning import tuning_split
-    with pytest.raises(ValueError):
-        tuning_split(20)
+def test_tuning_fit_and_eval_do_not_overlap(tune_inputs):
+    _, meta, tune_end = tune_inputs
+    fit, evaluate = tuning.tuning_rows(meta, tune_end)
+    assert fit.any() and evaluate.any() and not (fit & evaluate).any()
+    fit_targets = meta.loc[fit, "t"] + pd.to_timedelta(meta.loc[fit, "h"], unit="h")
+    assert fit_targets.max() < meta.loc[evaluate, "t"].min()
+    assert meta.loc[fit | evaluate, "delta"].notna().all()
 
 
-# ---------------------------------------------------------------------------
-# Tests for tune_lgbm
-# ---------------------------------------------------------------------------
-
-def _lgbm_inputs(N):
-    from app.config import N_FORECAST_HOURS, N_FEATURES
-    rng = np.random.default_rng(0)
-    bilstm_preds = rng.normal(size=(N, N_FORECAST_HOURS, N_FEATURES))
-    y_true = rng.normal(size=(N, N_FORECAST_HOURS, N_FEATURES))
-    base_times = pd.date_range("2024-01-01", periods=N, freq="h")
-    anchors = rng.normal(size=(N, N_FEATURES))
-    return bilstm_preds, y_true, base_times, anchors
+def test_tuning_rows_rejects_too_little_data(tune_inputs):
+    _, meta, _ = tune_inputs
+    with pytest.raises(ValueError, match="terlalu sedikit"):
+        tuning.tuning_rows(meta, meta["t"].min() + pd.Timedelta(hours=40))
 
 
-def test_tune_lgbm_returns_correct_keys(tmp_path, monkeypatch):
-    monkeypatch.setattr("app.models.tuning.MODELS_DIR", str(tmp_path))
-    monkeypatch.setattr("app.models.tuning.LGBM_TRIALS", 1)
-    from app.models.tuning import tune_lgbm
+# ── tune_lgbm ────────────────────────────────────────────────────────────────
 
-    bilstm_preds, y_true, base_times, anchors = _lgbm_inputs(150)
-    result = tune_lgbm(bilstm_preds, y_true, base_times, "uid_lgbm", anchors=anchors)
-
-    assert isinstance(result, dict)
-    assert "n_estimators" in result
-    assert "learning_rate" in result
-    assert "num_leaves" in result
-    # Kandidat dilatih di memori — tidak ada lgbm*.pkl produksi yang tertimpa.
-    assert list(tmp_path.iterdir()) == []
+def test_tune_lgbm_returns_params_within_search_space(tune_inputs):
+    df = tune_inputs[0]
+    best = tuning.tune_lgbm(df, n_trials=2)
+    assert set(best) == {"n_estimators", "learning_rate", "num_leaves", "min_child_samples"}
+    assert 150 <= best["n_estimators"] <= 600
+    assert 0.02 <= best["learning_rate"] <= 0.1
+    assert 15 <= best["num_leaves"] <= 63
 
 
-def test_tune_lgbm_scores_on_rows_it_never_fit(monkeypatch):
-    """Regresi: dulu objektif menilai model pada data latihnya sendiri, sehingga
-    Optuna selalu memilih konfigurasi paling overfit."""
-    monkeypatch.setattr("app.models.tuning.LGBM_TRIALS", 1)
-    from app.models.tuning import tune_lgbm, tuning_split
-    from app.config import N_FORECAST_HOURS, N_FEATURES
+def test_tune_lgbm_scores_candidates_out_of_sample(tune_inputs):
+    """Kandidat dilatih pada potongan awal dan dinilai pada potongan akhir."""
+    df, meta, tune_end = tune_inputs
+    fit, evaluate = tuning.tuning_rows(meta, tune_end)
+    fitted_on, scored_on = [], []
 
-    seen = {}
-
-    class SpyRegressor:
-        def __init__(self, estimator):
+    class Spy:
+        def __init__(self, **kw):
             pass
 
         def fit(self, X, y):
-            seen["fit"] = X.copy()
-            return self
+            fitted_on.append(len(X))
 
         def predict(self, X):
-            seen["predict"] = X.copy()
-            return np.zeros((len(X), N_FEATURES))
+            scored_on.append(len(X))
+            return [0.0] * len(X)
 
-    N = 150
-    bilstm_preds, y_true, base_times, anchors = _lgbm_inputs(N)
-    with patch("app.models.tuning.MultiOutputRegressor", SpyRegressor):
-        tune_lgbm(bilstm_preds, y_true, base_times, "uid_lgbm", anchors=anchors)
-
-    fit_end, eval_start = tuning_split(N)
-    assert len(seen["fit"]) == fit_end * N_FORECAST_HOURS
-    assert len(seen["predict"]) == (N - eval_start) * N_FORECAST_HOURS
-    fit_rows = {r.tobytes() for r in seen["fit"]}
-    assert not any(r.tobytes() in fit_rows for r in seen["predict"])
+    with patch("app.models.tuning.lgb.LGBMRegressor", Spy):
+        tuning.tune_lgbm(df, n_trials=1)
+    assert fitted_on == [int(fit.sum())] and scored_on == [int(evaluate.sum())]

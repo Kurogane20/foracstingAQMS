@@ -41,25 +41,13 @@ FEATURE_COLS = [
     "aqi_index_pm25", "aqi_index_pm10", "aqi_index_tsp", "aqi_index",
 ]
 
-# Cyclical time features added as extra BiLSTM inputs (not prediction targets)
-TIME_COLS = ["hour_sin", "hour_cos", "dow_sin", "dow_cos"]
+N_FEATURES = len(FEATURE_COLS)   # 14
 
-N_FEATURES      = len(FEATURE_COLS)   # 14
-N_TIME_FEATURES = len(TIME_COLS)      # 4
-
-METEO_COLS = [
-    "meteo_wind_speed",
-    "meteo_wind_dir_sin",
-    "meteo_wind_dir_cos",
-    "meteo_cloudcover",
-    "meteo_precip",       # curah hujan jam berjalan
-    "meteo_precip_3h",    # akumulasi 3 jam: menangkap permukaan yg masih basah
-]
-N_METEO_FEATURES = len(METEO_COLS)   # 6
-
-# Dinaikkan setiap kali bentuk input atau transformasi berubah. Model & scaler
+# Dinaikkan setiap kali bentuk fitur atau transformasi berubah. Artefak model
 # tersimpan dgn versi lain tidak kompatibel dan harus dilatih ulang.
-FEATURE_SCHEMA_VERSION = 4
+# v5: SSA-BiLSTM-LightGBM diganti LightGBM langsung multi-horizon (lihat
+# app/models/forecaster.py).
+FEATURE_SCHEMA_VERSION = 5
 
 # Batas kewajaran fisik per parameter: (min, maks, nilai_cadangan).
 #
@@ -93,26 +81,61 @@ PHYSICAL_LIMITS: dict[str, tuple[float, float, float]] = {
 }
 
 # Konsentrasi partikulat berdistribusi condong-kanan (mendekati lognormal):
-# median ~50 µg/m³ tapi ekor sampai >1.000. Dengan MinMaxScaler linier, seluruh
-# rentang normal tergencet ke ~3% skala dan model kehilangan resolusi di sana.
-# log1p membuat sebarannya mendekati simetris, memberi model resolusi di seluruh
-# rentang, sekaligus membuat galat relatif lebih berarti daripada galat absolut —
-# yang memang lebih tepat untuk konsentrasi.
+# median ~50 µg/m³ tapi ekor sampai >1.000. Model bekerja pada log1p(nilai):
+# sebarannya mendekati simetris, dan SELISIH di ruang itu setara RASIO dalam
+# satuan fisik — bentuk yang tepat untuk konsentrasi. Indeks kualitas udara
+# diturunkan dari konsentrasi dan mewarisi kecondongan yang sama.
 LOG_SCALE_COLS = [
     "pm_25", "pm_25_correction",
     "pm_10", "pm_10_correction",
     "tsp", "tsp_correction",
+    "aqi_index_pm25", "aqi_index_pm10", "aqi_index_tsp", "aqi_index",
 ]
-N_INPUT_HOURS   = 24
-N_FORECAST_HOURS = 6
 
-# Porsi akhir deret (kronologis) yang TIDAK dilatihkan. Dipakai bersama oleh
-# pra-pemrosesan (batas fit scaler) dan pipeline (pembagian latih/validasi),
-# supaya keduanya tidak pernah bergeser satu sama lain.
-VAL_FRACTION = 0.10
-SSA_WINDOW       = 12
-BILSTM_UNITS     = 128
+N_FORECAST_HOURS = 6
 TRAIN_HISTORY_HOURS = 24 * 365   # 1 tahun
+
+# Fitur terpanjang menengok 7 hari ke belakang (jam yang sama selama sepekan);
+# dua hari tambahan memberi ruang bagi celah data dan jam yang belum selesai.
+PREDICT_HISTORY_HOURS = 24 * 9
+
+# Zona waktu lokasi (WITA = UTC+8). Data disimpan UTC, tetapi siklus debu
+# mengikuti jam matahari dan gilir kerja setempat, jadi fitur jam/hari dihitung
+# pada jam lokal.
+LOCAL_UTC_OFFSET_HOURS = int(os.getenv("LOCAL_UTC_OFFSET_HOURS", 8))
+
+# Sensor melapor tiap menit (~60 bacaan/jam). Rata-rata dari segelintir bacaan
+# bukan rata-rata jam yang bermakna; jam seperti itu diperlakukan sebagai kosong,
+# baik untuk data latih maupun untuk nilai aktual pembanding.
+MIN_READINGS_PER_HOUR = 10
+
+# Jangkar prakiraan adalah nilai teramati terakhir. Bila jam terakhir kosong,
+# nilai paling lama sekian jam ke belakang masih boleh dipakai; lebih tua dari
+# itu, prakiraan untuk parameter tersebut tidak dibuat dari data basi.
+MAX_ANCHOR_AGE_HOURS = 3
+
+# Parameter utama untuk ringkasan skor dan tuning.
+PRIMARY_PARAM = "tsp"
+
+# ── Evaluasi rolling-origin ──────────────────────────────────────────────────
+# Tiap lipatan diuji dengan model yang hanya dilatih pada data SEBELUM lipatan
+# itu. Lipatan pertama hanya dipakai untuk kalibrasi (bobot penyusutan dan
+# pelebaran interval); skor dilaporkan dari lipatan kedua dan seterusnya, dengan
+# kalibrasi yang selalu berasal dari lipatan-lipatan sebelumnya.
+BACKTEST_FOLDS = int(os.getenv("BACKTEST_FOLDS", 6))
+BACKTEST_FOLD_HOURS = 24 * 28
+MIN_TRAIN_HOURS = 24 * 14        # data latih minimum sebelum lipatan pertama
+MIN_FOLD_HOURS = 24 * 3
+
+# Cakupan nominal pita prakiraan (P10–P90).
+INTERVAL_COVERAGE = 0.80
+
+# Ambang untuk metrik deteksi pelampauan (POD/FAR/CSI) pada laporan backtest.
+# Angkanya baku mutu udara ambien PP 22/2021 Lampiran VII — tetapi baku mutu itu
+# berlaku untuk RATA-RATA 24 JAM, sedangkan prakiraan ini per jam. Metriknya
+# mengukur kemampuan model memperingatkan jam berdebu tinggi; ini BUKAN
+# penilaian kepatuhan terhadap baku mutu.
+EXCEEDANCE_THRESHOLDS = {"tsp": 230.0, "pm_10": 75.0, "pm_25": 55.0}
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS_DIR = os.path.join(BASE_DIR, "saved_models")
