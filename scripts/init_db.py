@@ -31,6 +31,9 @@ def init_db() -> None:
         aqi_index_pm10   DOUBLE,
         aqi_index_tsp    DOUBLE,
         aqi_index        DOUBLE,
+        lower_bounds     JSON NULL,
+        upper_bounds     JSON NULL,
+        actual_values    JSON NULL,
         created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_uid_target (uid, target_time),
         INDEX idx_predicted_at (predicted_at)
@@ -47,6 +50,10 @@ def init_db() -> None:
         mae_score         DOUBLE,
         status            ENUM('untrained','ready','training','error') DEFAULT 'untrained',
         error_message     TEXT,
+        lat               DOUBLE NULL,
+        lng               DOUBLE NULL,
+        drift_score       DOUBLE NULL,
+        last_accuracy_check_at DATETIME NULL,
         updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
     """)
