@@ -1,13 +1,10 @@
 import logging
-import numpy as np
 from datetime import datetime, timezone
+
 from app.db import upsert_metadata
 from app.models.pipeline import run_training
-from app.models.preprocessor import (
-    preprocess_for_training, anchor_from_X, to_delta, train_split_index,
-)
-from app.models.tuning import load_best_params, tune_bilstm, tune_lgbm, save_best_params
-from app.models.bilstm import predict_bilstm, train_bilstm, _model_cache
+from app.models.preprocessor import load_for_training
+from app.models.tuning import load_best_params, save_best_params, tune_lgbm
 from app.training_progress import set_phase, clear_progress
 
 logger = logging.getLogger(__name__)
@@ -15,53 +12,20 @@ logger = logging.getLogger(__name__)
 
 def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
     try:
-        bilstm_params = None
-        lgbm_params = None
+        set_phase(uid, phase="preprocessing", percent=2)
+        hourly = load_for_training(uid)
+        lgbm_params = load_best_params(uid)
 
-        set_phase(uid, phase="preprocessing", percent=3)
-        params = load_best_params(uid)
-
-        if params is not None:
-            bilstm_params = params["bilstm"]
-            lgbm_params = params["lgbm"]
-        elif run_tuning:
+        if lgbm_params is None and run_tuning:
             upsert_metadata(uid, status="tuning")
+            set_phase(uid, phase="tuning", percent=3)
             logger.info(f"[{uid}] Starting tuning pass")
-
-            X, y, base_times = preprocess_for_training(uid)
-
-            # Jalur tuning harus memakai ruang target yang SAMA dengan jalur
-            # pelatihan (selisih terhadap nilai terakhir), kalau tidak parameter
-            # yang ditemukan dioptimalkan untuk masalah yang berbeda.
-            dy = to_delta(y, anchor_from_X(X))
-
-            # Tuning hanya boleh melihat porsi latih. Sebelumnya tune_bilstm
-            # menerima seluruh deret, sehingga potongan yang nanti dipakai
-            # run_training untuk mencari α dan MELAPORKAN skor ikut memilih
-            # hiperparameter — skornya jadi optimistis.
-            split = train_split_index(len(X))
-            X_train = X[:split]
-            dy_train = dy[:split]
-            anchor_train = anchor_from_X(X_train)
-
-            bilstm_params = tune_bilstm(X_train, dy_train, uid)
-            train_bilstm(X_train, dy_train, uid, **bilstm_params)
-            _model_cache.pop(uid, None)   # force reload of just-saved model
-            bilstm_preds = np.array([
-                predict_bilstm(X_train[i:i + 1], uid)[0]
-                for i in range(len(X_train))
-            ])
-            lgbm_params = tune_lgbm(bilstm_preds, dy_train, base_times[:split], uid,
-                                    anchors=anchor_train)
-            save_best_params(uid, bilstm_params, lgbm_params)
-            logger.info(f"[{uid}] Tuning complete, params saved")
+            lgbm_params = tune_lgbm(hourly)
+            save_best_params(uid, lgbm_params)
+            logger.info(f"[{uid}] Tuning complete, params saved: {lgbm_params}")
 
         upsert_metadata(uid, status="training")
-        if run_tuning and params is None:
-            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params,
-                                  X=X, y=y, base_times=base_times)
-        else:
-            result = run_training(uid, bilstm_params=bilstm_params, lgbm_params=lgbm_params)
+        result = run_training(uid, lgbm_params=lgbm_params, hourly=hourly)
         trained_at = datetime.now(timezone.utc).replace(tzinfo=None)
         clear_progress(uid)
         upsert_metadata(
@@ -72,7 +36,11 @@ def retrain_sensor(uid: str, run_tuning: bool = False) -> dict:
             mae_score=result["mae_score"],
             error_message=None,
         )
-        logger.info(f"[{uid}] Training complete — samples={result['training_samples']} mae={result['mae_score']}")
+        logger.info(
+            f"[{uid}] Training complete — jam={result['training_samples']} "
+            f"MAE TSP={result['mae_tsp']} µg/m³ (persistence {result['mae_persistence_tsp']}), "
+            f"skill={result['skill_vs_naive']}, cakupan={result['coverage_tsp']}"
+        )
         return {"uid": uid, "status": "ready", **result}
     except Exception as e:
         logger.error(f"[{uid}] Training failed: {e}")

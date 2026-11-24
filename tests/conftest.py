@@ -1,46 +1,69 @@
 import numpy as np
 import pandas as pd
 import pytest
-from app.config import FEATURE_COLS, N_INPUT_HOURS, N_FORECAST_HOURS, PHYSICAL_LIMITS
+from app.config import FEATURE_COLS, PHYSICAL_LIMITS
+
+# Model kecil agar tes cepat; perilaku yang diuji tidak bergantung ukuran model.
+FAST_PARAMS = {"n_estimators": 25, "learning_rate": 0.2, "num_leaves": 7,
+               "min_child_samples": 10, "n_jobs": 1}
 
 
-def _plausible_series(col: str, n: int) -> np.ndarray:
-    """Nilai acak yang masuk akal secara fisik untuk kolom ini.
+def make_hourly(days: int = 40, seed: int = 0, start: str = "2026-01-01") -> pd.DataFrame:
+    """Deret per jam sintetis yang menyerupai data nyata.
 
-    Sebelumnya semua kolom diisi uniform(0,100), yang membuat `mmhg` (600–820 hPa)
-    dan `temp` (5–55 °C) berada di luar rentang nyata. Begitu penyaringan berbasis
-    batas fisik diterapkan, fixture semacam itu ditolak seluruhnya dan tesnya
-    menguji hal yang salah.
+    TSP punya siklus harian kuat (malam tinggi, siang rendah, jam lokal UTC+8)
+    dikalikan derau lognormal berautokorelasi — struktur yang sama dengan data
+    Berau, sehingga model yang benar HARUS mengalahkan persistence di sini.
+    Semua nilai berada di dalam batas fisik.
     """
-    lo, hi, _ = PHYSICAL_LIMITS.get(col, (0.0, 100.0, 0.0))
-    span = hi - lo
-    # Ambil pita sempit di tengah rentang sah supaya tidak ada nilai batas.
-    return np.random.uniform(lo + 0.2 * span, lo + 0.4 * span, n)
+    rng = np.random.default_rng(seed)
+    n = days * 24
+    idx = pd.date_range(start, periods=n, freq="h")
+    local_hour = (idx.hour + 8) % 24
+    diurnal = 1.0 + 0.8 * np.cos(2 * np.pi * (local_hour - 3) / 24)
+
+    noise = np.zeros(n)
+    for i in range(1, n):
+        noise[i] = 0.8 * noise[i - 1] + rng.normal(0, 0.2)
+    tsp = 60.0 * diurnal * np.exp(noise)
+
+    df = pd.DataFrame(index=idx)
+    df["tsp"] = tsp
+    df["tsp_correction"] = tsp
+    df["pm_10"] = 0.6 * tsp * np.exp(rng.normal(0, 0.05, n))
+    df["pm_10_correction"] = 0.4 * df["pm_10"]
+    df["pm_25"] = 0.3 * tsp * np.exp(rng.normal(0, 0.05, n))
+    df["pm_25_correction"] = 0.5 * df["pm_25"]
+    df["noise"] = 52.0 + rng.normal(0, 0.5, n)
+    df["temp"] = 27.0 - 3.0 * np.cos(2 * np.pi * (local_hour - 14) / 24) + rng.normal(0, 0.3, n)
+    df["mmhg"] = 757.0 + rng.normal(0, 0.5, n)
+    df["humidity"] = np.clip(85.0 + 10.0 * np.cos(2 * np.pi * (local_hour - 4) / 24)
+                             + rng.normal(0, 2, n), 1, 100)
+    df["aqi_index_pm25"] = np.clip(df["pm_25"] * 4.0, 0, 500)
+    df["aqi_index_pm10"] = np.clip(df["pm_10"] * 0.9, 0, 500)
+    df["aqi_index_tsp"] = np.clip(tsp * 0.24, 0, 500)
+    df["aqi_index"] = df[["aqi_index_pm25", "aqi_index_pm10", "aqi_index_tsp"]].max(axis=1)
+    df = df[FEATURE_COLS].astype("float64")
+    for col, (lo, hi, _) in PHYSICAL_LIMITS.items():
+        assert df[col].between(lo, hi).all(), col
+    return df
 
 
 @pytest.fixture
-def sample_hourly_df():
-    """24 rows of hourly sensor data, all columns present and physically valid."""
-    np.random.seed(42)
-    index = pd.date_range("2024-01-01", periods=N_INPUT_HOURS, freq="h")
-    data = {col: _plausible_series(col, N_INPUT_HOURS) for col in FEATURE_COLS}
-    return pd.DataFrame(data, index=index)
+def hourly_df():
+    return make_hourly()
 
 
 @pytest.fixture
-def sample_minute_df():
-    """1440 rows of per-minute sensor data."""
-    np.random.seed(42)
-    n = 1440
-    timestamps = [int(pd.Timestamp("2024-01-01").timestamp()) + i * 60 for i in range(n)]
-    data = {"datetime_unix": timestamps}
-    for col in FEATURE_COLS:
-        data[col] = np.random.uniform(0, 100, n)
-    return pd.DataFrame(data)
+def fast_params():
+    return dict(FAST_PARAMS)
 
 
 @pytest.fixture
-def sample_sequence_data():
-    """Array of shape (100, 14) for sequence creation tests."""
-    np.random.seed(42)
-    return np.random.uniform(0, 1, (100, len(FEATURE_COLS)))
+def models_dir(tmp_path, monkeypatch):
+    """Arahkan semua modul yang menulis artefak ke folder sementara."""
+    for mod in ("app.models.forecaster", "app.models.pipeline", "app.models.tuning"):
+        monkeypatch.setattr(f"{mod}.MODELS_DIR", str(tmp_path))
+    from app.models import forecaster
+    monkeypatch.setattr(forecaster, "_cache", {})
+    return tmp_path

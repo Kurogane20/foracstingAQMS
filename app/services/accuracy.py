@@ -4,7 +4,9 @@ import numpy as np
 import mysql.connector
 from datetime import datetime, timezone
 
-from app.config import SENSOR_DB_CONFIG, FEATURE_COLS, PHYSICAL_LIMITS
+from app.config import (
+    SENSOR_DB_CONFIG, FEATURE_COLS, PHYSICAL_LIMITS, MIN_READINGS_PER_HOUR, PRIMARY_PARAM,
+)
 from app.db import (
     get_unresolved_predictions,
     update_prediction_actuals,
@@ -17,14 +19,6 @@ logger = logging.getLogger(__name__)
 
 DRIFT_THRESHOLD = 1.5
 DRIFT_WINDOW = 24
-
-# Sensor melapor tiap menit (~60 bacaan/jam). Rata-rata dari segelintir bacaan
-# bukan rata-rata jam yang bermakna, dan akan dicatat sebagai "aktual" seolah
-# setara dengan yang dilatihkan ke model.
-MIN_READINGS_PER_HOUR = 10
-
-# Parameter resmi yang dipantau & dilaporkan. Dipakai sebagai dasar metrik.
-PRIMARY_PARAM = "tsp"
 
 
 def fetch_actual_for_step(uid: str, target_time: datetime) -> dict | None:
