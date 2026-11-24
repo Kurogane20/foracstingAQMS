@@ -282,3 +282,23 @@ def test_get_unresolved_predictions_waits_for_full_target_hour():
     sql = cursor_mock.execute.call_args[0][0]
     assert "UTC_TIMESTAMP() - INTERVAL 1 HOUR" in sql
     assert "NOW()" not in sql
+
+
+# ---------------------------------------------------------------------------
+# get_all_uids
+# ---------------------------------------------------------------------------
+
+def test_get_all_uids_uses_index_only_query():
+    """Kueri daftar sensor tidak boleh menyaring kolom tak berindeks (deleted_at)."""
+    from app.db import get_all_uids
+    cursor_mock = MagicMock()
+    cursor_mock.fetchall.return_value = [("AQI01B",), ("AQI02S",)]
+    conn_mock = MagicMock()
+    conn_mock.cursor.return_value = cursor_mock
+    with patch("app.db.mysql.connector.connect", return_value=conn_mock):
+        result = get_all_uids()
+    assert result == ["AQI01B", "AQI02S"]
+    sql = cursor_mock.execute.call_args[0][0]
+    assert "DISTINCT uid" in sql
+    assert "deleted_at" not in sql
+    conn_mock.close.assert_called_once()

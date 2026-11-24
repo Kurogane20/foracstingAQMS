@@ -17,12 +17,20 @@ def _parse_bounds(row: dict) -> dict:
 
 
 def get_all_uids() -> list[str]:
+    """Daftar sensor (uid) yang pernah mengirim data.
+
+    Sengaja TANPA filter ``deleted_at``: kolom itu tidak berindeks, sehingga filter
+    tersebut memaksa pemindaian penuh t_loggers (5,4 juta baris, 20–60 detik di RDS)
+    setiap /retrain/all, /predict/all, dan siklus prediksi per jam. Tanpa filter,
+    MySQL cukup membaca indeks (uid, datetime_unix) dengan loose index scan
+    ("Using index for group-by", ±0,05 detik). Hasilnya sama untuk data AQMS
+    (diuji 24 Nov 2026: 15 uid identik); baris yang dihapus tetap disaring oleh
+    kueri data per sensor.
+    """
     conn = mysql.connector.connect(**SENSOR_DB_CONFIG)
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT DISTINCT uid FROM t_loggers WHERE deleted_at IS NULL ORDER BY uid"
-        )
+        cursor.execute("SELECT DISTINCT uid FROM t_loggers ORDER BY uid")
         return [row[0] for row in cursor.fetchall()]
     finally:
         conn.close()
